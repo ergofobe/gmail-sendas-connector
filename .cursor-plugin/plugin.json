@@ -1,0 +1,45 @@
+{
+  "name": "gmail-sendas",
+  "displayName": "Gmail sendAs + attachments",
+  "version": "1.0.0",
+  "description": "Thin Gmail MCP for sendAs aliases and attachment bytes. Complements stock Gmail MCP — do not use this plugin for inbox search, labels, or triage.",
+  "author": {
+    "name": "Oberon"
+  },
+  "homepage": "https://github.com/ergofobe/gmail-sendas-connector",
+  "repository": "https://github.com/ergofobe/gmail-sendas-connector",
+  "license": "MIT",
+  "keywords": [
+    "gmail",
+    "sendas",
+    "attachments",
+    "workspace",
+    "mcp"
+  ],
+  "logo": "assets/logo.svg",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "GOOGLE_CLIENT_ID": {
+        "type": "string",
+        "title": "Google OAuth client ID",
+        "description": "OAuth 2.0 client ID from Google Cloud Console (Desktop or Web client). Never commit this value."
+      },
+      "GOOGLE_CLIENT_SECRET": {
+        "type": "string",
+        "title": "Google OAuth client secret",
+        "description": "OAuth 2.0 client secret from Google Cloud Console. Set in Plugins → Configure only."
+      },
+      "GOOGLE_REFRESH_TOKEN": {
+        "type": "string",
+        "title": "Google OAuth refresh token",
+        "description": "Offline refresh token for the Workspace user who owns the sendAs aliases. Generate once with scripts/oauth-setup.js; paste here. Never commit."
+      }
+    },
+    "required": [
+      "GOOGLE_CLIENT_ID",
+      "GOOGLE_CLIENT_SECRET",
+      "GOOGLE_REFRESH_TOKEN"
+    ]
+  }
+}

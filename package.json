@@ -1,0 +1,30 @@
+{
+  "name": "gmail-sendas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cursor plugin: Gmail sendAs + attachment bytes (complements stock Gmail MCP)",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "gmail-sendas": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/*.test.js",
+    "oauth-setup": "node scripts/oauth-setup.js"
+  },
+  "keywords": [
+    "cursor",
+    "plugin",
+    "gmail",
+    "sendas",
+    "mcp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ergofobe/gmail-sendas-connector.git"
+  }
+}
