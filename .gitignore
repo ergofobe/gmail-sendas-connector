@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.pem
+.token
+.tokens.json
+oauth-tokens.json
+refresh-token.txt
+.DS_Store
+coverage/
+tmp/
+*.log
