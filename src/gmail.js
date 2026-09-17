@@ -1,6 +1,6 @@
 /**
  * Thin Gmail REST helpers (fetch + refresh-token OAuth).
- * Zero npm runtime deps — googleapis is not used (the three endpoints do
+ * Zero npm runtime deps — googleapis is not used (these REST endpoints do
  * not justify the install).
  *
  * @typedef {object} SendAs
@@ -41,6 +41,20 @@
  * @property {string} [html] HTML body (used with or instead of body)
  * @property {string} [cc]
  * @property {string} [bcc]
+ * @property {string} [inReplyTo] RFC Message-ID of the parent (reply threading)
+ * @property {string} [references] RFC References chain (reply threading)
+ * @property {SendAttachmentInput[]|SendAttachmentInput|ResolvedAttachment[]} [attachments]
+ *
+ * @typedef {object} ReplyAsArgs
+ * @property {string} messageId inbound Gmail message id to reply to (required)
+ * @property {string} [threadId] optional; defaults to the parent message threadId
+ * @property {string} [from] explicit Workspace sendAs alias
+ * @property {string} [to] default: parent Reply-To or From (reply-to-sender)
+ * @property {string} [cc]
+ * @property {string} [bcc]
+ * @property {boolean} [replyAll]
+ * @property {string} [body]
+ * @property {string} [html]
  * @property {SendAttachmentInput[]|SendAttachmentInput|ResolvedAttachment[]} [attachments]
  */
 
@@ -64,6 +78,21 @@ const PRIMARY_MIME_BY_EXT = {
 
 const SEND_ENDPOINT = `${GMAIL_API}/users/me/messages/send`;
 const SEND_AS_ENDPOINT = `${GMAIL_API}/users/me/settings/sendAs`;
+
+/** Parent headers fetched for From inference + RFC2822 reply threading. */
+export const REPLY_METADATA_HEADERS = [
+  "Delivered-To",
+  "X-Original-To",
+  "To",
+  "From",
+  "Reply-To",
+  "Cc",
+  "Bcc",
+  "Subject",
+  "Message-ID",
+  "References",
+  "In-Reply-To",
+];
 
 /**
  * @param {string|Buffer} input
@@ -121,6 +150,277 @@ export function parseSendResult(payload) {
     result.threadId = payload.threadId;
   }
   return result;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+export function extractEmails(value) {
+  if (value == null || String(value).trim() === "") return [];
+  const found = String(value).match(
+    /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
+  );
+  return found ? found.slice() : [];
+}
+
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+/**
+ * Case-insensitive match of an address (or `Name <addr>` header) to sendAs.
+ * @param {unknown} emailOrHeader
+ * @param {SendAs[]} aliases
+ * @returns {SendAs|null}
+ */
+export function matchSendAs(emailOrHeader, aliases) {
+  const extracted = extractEmails(emailOrHeader);
+  const needle = normalizeEmail(
+    extracted[0] || String(emailOrHeader || "").trim()
+  );
+  if (!needle) return null;
+  const list = Array.isArray(aliases) ? aliases : [];
+  return list.find((row) => row && normalizeEmail(row.sendAsEmail) === needle) || null;
+}
+
+/**
+ * @param {unknown} source Gmail message, { headers }, or header array
+ * @returns {Record<string, string[]>}
+ */
+export function collectHeaders(source) {
+  /** @type {unknown[]} */
+  let list = [];
+  if (Array.isArray(source)) {
+    list = source;
+  } else if (source && typeof source === "object") {
+    const obj = /** @type {{ payload?: { headers?: unknown[] }, headers?: unknown[] }} */ (source);
+    if (obj.payload && Array.isArray(obj.payload.headers)) {
+      list = obj.payload.headers;
+    } else if (Array.isArray(obj.headers)) {
+      list = obj.headers;
+    }
+  }
+  /** @type {Record<string, string[]>} */
+  const map = {};
+  for (const row of list) {
+    if (!row || typeof row !== "object") continue;
+    const rec = /** @type {{ name?: unknown, value?: unknown }} */ (row);
+    const key = String(rec.name || "").trim().toLowerCase();
+    if (!key) continue;
+    if (!map[key]) map[key] = [];
+    map[key].push(String(rec.value ?? ""));
+  }
+  return map;
+}
+
+/**
+ * @param {Record<string, string[]>} headers
+ * @param {string} name
+ * @returns {string[]}
+ */
+export function headerValues(headers, name) {
+  if (!headers || typeof headers !== "object") return [];
+  return headers[String(name).toLowerCase()] || [];
+}
+
+/**
+ * @param {Record<string, string[]>} headers
+ * @param {string} name
+ * @returns {string}
+ */
+export function firstHeader(headers, name) {
+  const values = headerValues(headers, name);
+  return values.length > 0 ? values[0] : "";
+}
+
+/**
+ * Landed-address candidates in spec order: Delivered-To, X-Original-To, To.
+ * @param {Record<string, string[]>} headers
+ * @returns {string[]}
+ */
+export function collectLandedAddresses(headers) {
+  const ordered = [];
+  const seen = new Set();
+  for (const name of ["delivered-to", "x-original-to", "to"]) {
+    for (const value of headerValues(headers, name)) {
+      for (const email of extractEmails(value)) {
+        const norm = normalizeEmail(email);
+        if (!norm || seen.has(norm)) continue;
+        seen.add(norm);
+        ordered.push(email);
+      }
+    }
+  }
+  return ordered;
+}
+
+/**
+ * Resolve the From alias for reply_as.
+ * 1. Explicit `from` must be a sendAs alias.
+ * 2. Else first landed header (Delivered-To, X-Original-To, To) that matches sendAs.
+ * 3. Else fail — caller must pass explicit from.
+ *
+ * @param {unknown} explicitFrom
+ * @param {Record<string, string[]>} headers
+ * @param {SendAs[]} aliases
+ * @returns {string} canonical sendAsEmail
+ */
+export function resolveReplyFrom(explicitFrom, headers, aliases) {
+  const list = Array.isArray(aliases) ? aliases : [];
+
+  if (explicitFrom != null && String(explicitFrom).trim() !== "") {
+    const wanted = String(explicitFrom).trim();
+    const match = matchSendAs(wanted, list);
+    if (!match) {
+      throw new Error(
+        `from (${wanted}) is not an allowed sendAs alias on this mailbox. Call list_send_as and pass a verified from.`
+      );
+    }
+    return match.sendAsEmail;
+  }
+
+  const landed = collectLandedAddresses(headers);
+  for (const addr of landed) {
+    const match = matchSendAs(addr, list);
+    if (match) return match.sendAsEmail;
+  }
+
+  const shown =
+    landed.length > 0
+      ? landed.join(", ")
+      : "(none found in Delivered-To / X-Original-To / To)";
+  throw new Error(
+    `Could not infer a sendAs From address. Landed address ${shown} is not a sendAs alias on this mailbox. Pass explicit from (a verified sendAs from list_send_as).`
+  );
+}
+
+/**
+ * @param {string} [original]
+ * @returns {string}
+ */
+export function replySubject(original) {
+  const subject = original == null ? "" : String(original).trim();
+  if (!subject) return "Re:";
+  if (/^re\s*:/i.test(subject)) return subject;
+  return `Re: ${subject}`;
+}
+
+/**
+ * @param {string} id
+ * @returns {string}
+ */
+export function ensureAngleAddr(id) {
+  const value = String(id || "").trim();
+  if (!value) return "";
+  if (value.startsWith("<") && value.endsWith(">")) return value;
+  return `<${value}>`;
+}
+
+/**
+ * @param {Record<string, string[]>} headers
+ * @returns {{ inReplyTo: string, references: string }}
+ */
+export function buildThreadingHeaders(headers) {
+  const messageId = firstHeader(headers, "message-id").trim();
+  const existingRefs = firstHeader(headers, "references").trim();
+  const inReplyTo = messageId ? ensureAngleAddr(messageId) : "";
+  const tokens = existingRefs ? existingRefs.split(/\s+/).filter(Boolean) : [];
+  const normalized = tokens.map(ensureAngleAddr).filter(Boolean);
+  if (inReplyTo && !normalized.some((token) => token === inReplyTo)) {
+    normalized.push(inReplyTo);
+  }
+  return { inReplyTo, references: normalized.join(" ") };
+}
+
+/**
+ * Default To is Reply-To, else From (reply-to-sender).
+ * replyAll fills Cc from original To/Cc minus ourselves and the To recipient.
+ *
+ * @param {object} args
+ * @param {unknown} [args.to]
+ * @param {unknown} [args.cc]
+ * @param {unknown} [args.bcc]
+ * @param {unknown} [args.replyAll]
+ * @param {Record<string, string[]>} headers
+ * @param {string} fromEmail
+ * @returns {{ to: string, cc?: string, bcc?: string }}
+ */
+export function resolveReplyRecipients(args, headers, fromEmail) {
+  const fromNorm = normalizeEmail(fromEmail);
+  const explicitTo = args && args.to != null ? String(args.to).trim() : "";
+  const to = explicitTo || defaultReplyTo(headers);
+  if (!to) {
+    throw new Error(
+      "Could not determine reply To address from the parent From/Reply-To. Pass to explicitly."
+    );
+  }
+
+  const explicitCc = args && args.cc != null ? String(args.cc).trim() : "";
+  let cc = explicitCc;
+  if (!cc && args && (args.replyAll === true || args.replyAll === "true")) {
+    cc = buildReplyAllCc(headers, to, fromNorm);
+  }
+
+  const bcc = args && args.bcc != null ? String(args.bcc).trim() : "";
+  /** @type {{ to: string, cc?: string, bcc?: string }} */
+  const result = { to };
+  if (cc) result.cc = cc;
+  if (bcc) result.bcc = bcc;
+  return result;
+}
+
+/**
+ * @param {Record<string, string[]>} headers
+ * @returns {string}
+ */
+function defaultReplyTo(headers) {
+  const replyTo = firstHeader(headers, "reply-to").trim();
+  if (replyTo) return replyTo;
+  return firstHeader(headers, "from").trim();
+}
+
+/**
+ * @param {Record<string, string[]>} headers
+ * @param {string} toHeader
+ * @param {string} fromNorm
+ * @returns {string}
+ */
+function buildReplyAllCc(headers, toHeader, fromNorm) {
+  const skip = new Set(extractEmails(toHeader).map(normalizeEmail));
+  skip.add(fromNorm);
+  const extras = [...headerValues(headers, "to"), ...headerValues(headers, "cc")];
+  const keep = [];
+  const seen = new Set();
+  for (const value of extras) {
+    for (const email of extractEmails(value)) {
+      const norm = normalizeEmail(email);
+      if (!norm || skip.has(norm) || seen.has(norm)) continue;
+      seen.add(norm);
+      keep.push(email);
+    }
+  }
+  return keep.join(", ");
+}
+
+/**
+ * GET users.me.messages/{id} (metadata + reply headers).
+ * @param {string} messageId
+ * @returns {string}
+ */
+export function messageGetUrl(messageId) {
+  const params = new URLSearchParams({ format: "metadata" });
+  for (const header of REPLY_METADATA_HEADERS) {
+    params.append("metadataHeaders", header);
+  }
+  return (
+    `${GMAIL_API}/users/me/messages/` +
+    `${encodeURIComponent(messageId)}?${params.toString()}`
+  );
 }
 
 /**
@@ -455,6 +755,16 @@ export function buildRfc2822(args, opts = {}) {
   if (args.cc) headers.push(`Cc: ${normalizeAddrs(args.cc)}`);
   if (args.bcc) headers.push(`Bcc: ${normalizeAddrs(args.bcc)}`);
   headers.push(`Subject: ${encodeSubject(subject)}`);
+  if (args.inReplyTo) {
+    const inReplyTo = String(args.inReplyTo).trim();
+    assertSingleLine("In-Reply-To", inReplyTo);
+    headers.push(`In-Reply-To: ${inReplyTo}`);
+  }
+  if (args.references) {
+    const references = String(args.references).trim();
+    assertSingleLine("References", references);
+    headers.push(`References: ${references}`);
+  }
   headers.push("MIME-Version: 1.0");
 
   if (attachments.length === 0) {
@@ -631,6 +941,66 @@ export function createGmailClient({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ raw: toBase64Url(mime) }),
+      });
+      return parseSendResult(payload);
+    },
+
+    /**
+     * In-thread reply From a sendAs alias (inferred or explicit).
+     * POST users.messages.send with { raw, threadId }.
+     * @param {ReplyAsArgs} args
+     * @param {{ boundary?: string, mixedBoundary?: string, altBoundary?: string }} [mimeOpts]
+     * @returns {Promise<SendResult>}
+     */
+    async replyAs(args, mimeOpts) {
+      const messageId = String(args.messageId || "").trim();
+      if (!messageId) {
+        throw new Error(
+          "messageId is required (inbound Gmail message to reply to). threadId is optional."
+        );
+      }
+      const text = args.body == null ? "" : String(args.body);
+      const html = args.html == null ? "" : String(args.html);
+      if (!text && !html) throw new Error("body and/or html is required");
+
+      const [aliases, parent] = await Promise.all([
+        this.listSendAs(),
+        gmailFetch(messageGetUrl(messageId)),
+      ]);
+
+      const headers = collectHeaders(parent);
+      const from = resolveReplyFrom(args.from, headers, aliases);
+      const recipients = resolveReplyRecipients(args, headers, from);
+      const subject = replySubject(firstHeader(headers, "Subject"));
+      const threading = buildThreadingHeaders(headers);
+      const threadId = String(args.threadId || parent.threadId || "").trim();
+      if (!threadId) {
+        throw new Error(
+          "threadId is required to keep the reply in the Gmail thread; the parent message did not include one. Pass threadId."
+        );
+      }
+
+      const attachments = await resolveSendAttachments(args.attachments);
+      const mime = buildRfc2822(
+        {
+          from,
+          to: recipients.to,
+          cc: recipients.cc,
+          bcc: recipients.bcc,
+          subject,
+          body: text || undefined,
+          html: html || undefined,
+          attachments,
+          inReplyTo: threading.inReplyTo || undefined,
+          references: threading.references || undefined,
+        },
+        mimeOpts
+      );
+
+      const payload = await gmailFetch(SEND_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ raw: toBase64Url(mime), threadId }),
       });
       return parseSendResult(payload);
     },

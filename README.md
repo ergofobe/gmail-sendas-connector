@@ -1,11 +1,12 @@
 # gmail-sendas
 
-Cursor plugin (**Gmail sendAs + attachments**) that fills two gaps in the stock Gmail MCP:
+Cursor plugin (**Gmail sendAs + attachments**) that fills gaps in the stock Gmail MCP:
 
-1. **From / sendAs** — send mail as a verified Workspace alias, including **attach-on-send** for outbound PDFs/images
-2. **Attachment bytes** — download inbound file data the stock connector cannot return
+1. **From / sendAs** — send a *new* message as a verified Workspace alias, including **attach-on-send** for outbound PDFs/images (`send_as`)
+2. **In-thread reply From the landed alias** — stock Gmail `reply` threads correctly but always sends From the primary mailbox. Use `reply_as` when inbound landed on an alias (`reply_as`)
+3. **Attachment bytes** — download inbound file data the stock connector cannot return (`get_attachment`)
 
-Keep **stock Gmail MCP** for inbox search, labels, and triage. This plugin is not a Gmail replacement.
+Keep **stock Gmail MCP** for inbox search, labels, and triage (including stock `reply` when From the primary mailbox is fine). This plugin is not a Gmail replacement.
 
 ## File tree
 
@@ -16,7 +17,7 @@ Keep **stock Gmail MCP** for inbox search, labels, and triage. This plugin is no
 ├── skills/gmail-sendas/SKILL.md
 ├── src/
 │   ├── index.js                 # stdio entry
-│   ├── server.js                # MCP JSON-RPC + three tools
+│   ├── server.js                # MCP JSON-RPC + four tools
 │   ├── gmail.js                 # fetch + MIME + OAuth refresh
 │   └── secrets.js               # creds check + redaction
 ├── scripts/oauth-setup.js       # one-time helper; prints refresh token only
@@ -35,9 +36,29 @@ No rules, hooks, agents, or commands.
 | --- | --- | --- |
 | `list_send_as` | `GET https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs` | `SendAs[]` |
 | `send_as` | `POST .../users/me/messages/send` with RFC2822 MIME `raw` (base64url); optional outbound attachments as multipart/mixed | `SendResult` (`id`, optional `threadId`) only |
+| `reply_as` | `GET` parent message + `POST .../users/me/messages/send` with `{ raw, threadId }` (In-Reply-To / References) | `SendResult` (`id`, `threadId`) only |
 | `get_attachment` | `GET .../users/me/messages/{messageId}/attachments/{attachmentId}` | `AttachmentBody`; writes a file when `path` is set |
 
+**When to use which send/reply tool**
+
+| Need | Tool |
+| --- | --- |
+| New message that must From a Workspace alias | `send_as` (this plugin) |
+| In-thread reply that must From the address the mail landed on (or another sendAs) | `reply_as` (this plugin) |
+| In-thread reply when From the primary mailbox is OK | stock Gmail `reply` |
+| Inbox search, labels, triage | stock Gmail MCP |
+
 `send_as` required arguments: `from` (sendAs alias email), `to`, `subject`, and `body` (plain text) and/or `html`. Optional: `cc`, `bcc`, `attachments`. The From header is set to the alias.
+
+`reply_as` required arguments: `messageId` (inbound Gmail message to reply to) and `body` and/or `html`. Optional: `threadId` (defaults to the parent message's threadId), `from`, `to`, `cc`, `bcc`, `replyAll`, `attachments` (same shape as `send_as`). `messageId` is required; `threadId` is optional.
+
+**From resolution (`reply_as`)**
+
+1. If `from` is provided, use it — it must be an allowed sendAs alias (`list_send_as`).
+2. Else infer from the inbound headers, preferring in order: **Delivered-To**, **X-Original-To**, then **To** (parse the address). Use the first that matches a sendAs alias (case-insensitive).
+3. If none match: fail clearly — pass explicit `from`, or the landed address is not a sendAs on this mailbox.
+
+Threading: RFC2822 `In-Reply-To` / `References` from the parent, `Subject` prefixed with `Re:` when needed, and `users.messages.send` with `threadId` set so the reply stays in the Gmail thread. Default recipients are reply-to-sender (parent `Reply-To` or `From`); `replyAll` adds original To/Cc except our sendAs address.
 
 **Attach-on-send** (when the caller already has a local file and must send From an alias — do not fall back to the Gmail compose UI):
 
@@ -79,7 +100,16 @@ Base64 fallback when no local path is available:
 }
 ```
 
-After merge, **restart / reinstall the MCP server** for Grok Bot stdio installs. Tool schemas are loaded at process start (`tools/list` from `TOOL_DEFS`); an already-running stdio process will not advertise `attachments` until it is restarted.
+Example `reply_as` (omit `from` so Delivered-To can infer the logistics alias):
+
+```json
+{
+  "messageId": "18f2c0ab1234def0",
+  "body": "Got it — confirming pickup."
+}
+```
+
+After merge, **restart / reinstall the MCP server** for Grok Bot stdio installs. Tool schemas are loaded at process start (`tools/list` from `TOOL_DEFS`); an already-running stdio process will not advertise `reply_as` or `attachments` until it is restarted.
 
 OAuth tokens are never returned or logged.
 
@@ -96,7 +126,7 @@ OAuth tokens are never returned or logged.
 
 ## Implementation choice
 
-**Zero runtime npm dependencies.** Node 18+ `fetch` refreshes the access token and calls Gmail REST. `googleapis` is not used — three endpoints do not justify the install. The MCP layer is a small stdio JSON-RPC 2.0 shim (newline-delimited, plus Content-Length read for older clients) instead of `@modelcontextprotocol/sdk`.
+**Zero runtime npm dependencies.** Node 18+ `fetch` refreshes the access token and calls Gmail REST. `googleapis` is not used — these endpoints do not justify the install. The MCP layer is a small stdio JSON-RPC 2.0 shim (newline-delimited, plus Content-Length read for older clients) instead of `@modelcontextprotocol/sdk`.
 
 ## Auth (Jim — one-time, local)
 
@@ -154,6 +184,7 @@ Requires Node 18+. Coverage (all mocked):
 - `list_send_as` response parsing
 - `send_as` builds the From header and `users.messages.send` `{ raw }` body
 - `send_as` attachments: multipart/mixed Content-Type / Content-Disposition, path read, base64 fallback, ~25MB oversize reject; no-attachment MIME unchanged
+- `reply_as` From inference (Delivered-To / To), explicit `from` wins, fail when inferred address is not sendAs, In-Reply-To / References / threadId set, attachments on reply
 - `get_attachment` decodes base64url and writes a file of the expected byte length
 - Missing-credential / refresh errors never echo secrets or file contents
 
@@ -163,7 +194,8 @@ Not run in CI. After Configure is filled:
 
 1. In Cursor, ask: *List my Gmail sendAs aliases.* Expect verified rows for the logistics / holdings / group domains as configured on the mailbox.
 2. Send a test: *Send a short test to myself From the logistics alias* (`send_as` with `from` = that `*.oberonlogistics.com` address). Confirm the message in Gmail shows the alias as From. Note the returned `id` only.
-3. Download a known inbound PDF: use stock Gmail to find a message and its `attachmentId`, then *Save that attachment to `/tmp/rate-con.pdf`* via `get_attachment`. Confirm the file opens and the byte length is non-zero.
+3. **Reply-as smoke (Jim):** pick an inbound thread that landed on the logistics alias (`jim.phillips@oberonlogistics.com`). Ask: *Reply on that thread saying “got it” From the address it landed on* (`reply_as` with that message’s `messageId`; omit `from` so inference can run). Confirm **Sent / From is the logistics alias**, not `jim.phillips@oberon.group`, and that the reply stayed in the same Gmail thread. No live send in CI.
+4. Download a known inbound PDF: use stock Gmail to find a message and its `attachmentId`, then *Save that attachment to `/tmp/rate-con.pdf`* via `get_attachment`. Confirm the file opens and the byte length is non-zero.
 
 ## From-routing (no secrets)
 

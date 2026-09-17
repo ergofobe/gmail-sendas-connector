@@ -5,12 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import {
   buildRfc2822,
+  buildThreadingHeaders,
+  collectHeaders,
+  collectLandedAddresses,
   createGmailClient,
   fromBase64Url,
   inferMimeType,
   inspectSendCall,
+  messageGetUrl,
   parseSendAsList,
   parseSendResult,
+  replySubject,
+  resolveReplyFrom,
   resolveSendAttachments,
   toBase64Url,
   GMAIL_API,
@@ -416,6 +422,289 @@ describe("send_as outbound attachments", () => {
         return true;
       }
     );
+  });
+});
+
+const PRIMARY = "jim.phillips@oberon.group";
+const LOGISTICS = "jim.phillips@oberonlogistics.com";
+
+const DEFAULT_SEND_AS = [
+  {
+    sendAsEmail: PRIMARY,
+    displayName: "Jim",
+    isPrimary: true,
+    isDefault: true,
+    verificationStatus: "accepted",
+  },
+  {
+    sendAsEmail: LOGISTICS,
+    displayName: "Logistics",
+    isPrimary: false,
+    isDefault: false,
+    verificationStatus: "accepted",
+  },
+];
+
+function parentMessage(headers, extras = {}) {
+  return {
+    id: extras.id || "inbound-1",
+    threadId: extras.threadId || "thr-logistics",
+    payload: { headers },
+  };
+}
+
+function mockReplyFetch({
+  sendAs = DEFAULT_SEND_AS,
+  message,
+  sendResult = { id: "reply-1", threadId: "thr-logistics" },
+} = {}) {
+  /** @type {{ url: string, init: RequestInit }[]} */
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const u = String(url);
+    calls.push({ url: u, init: init || {} });
+    if (u.includes("/settings/sendAs")) {
+      return /** @type {Response} */ ({
+        ok: true,
+        json: async () => ({ sendAs }),
+      });
+    }
+    if (u.includes("/messages/send")) {
+      return /** @type {Response} */ ({
+        ok: true,
+        json: async () => sendResult,
+      });
+    }
+    if (u.includes("/messages/")) {
+      return /** @type {Response} */ ({
+        ok: true,
+        json: async () => message,
+      });
+    }
+    throw new Error(`unexpected url ${u}`);
+  };
+  return { calls, fetchImpl };
+}
+
+describe("reply_as From inference + threading", () => {
+  it("infers From from Delivered-To when it matches sendAs", () => {
+    const headers = collectHeaders([
+      { name: "Delivered-To", value: "Jim.Phillips@OberonLogistics.com" },
+      { name: "To", value: `Jim Phillips <${PRIMARY}>` },
+    ]);
+    assert.deepEqual(collectLandedAddresses(headers), [
+      "Jim.Phillips@OberonLogistics.com",
+      PRIMARY,
+    ]);
+    assert.equal(resolveReplyFrom(undefined, headers, DEFAULT_SEND_AS), LOGISTICS);
+  });
+
+  it("infers From from To when Delivered-To / X-Original-To do not match", () => {
+    const headers = collectHeaders([
+      { name: "Delivered-To", value: "catchall@forwarded.example" },
+      { name: "To", value: `Dispatch <${LOGISTICS}>` },
+    ]);
+    assert.equal(resolveReplyFrom("", headers, DEFAULT_SEND_AS), LOGISTICS);
+  });
+
+  it("prefers X-Original-To over To", () => {
+    const headers = collectHeaders([
+      { name: "X-Original-To", value: LOGISTICS },
+      { name: "To", value: PRIMARY },
+    ]);
+    assert.equal(resolveReplyFrom(null, headers, DEFAULT_SEND_AS), LOGISTICS);
+  });
+
+  it("explicit from wins over inferred landed address", () => {
+    const headers = collectHeaders([
+      { name: "Delivered-To", value: LOGISTICS },
+      { name: "To", value: LOGISTICS },
+    ]);
+    assert.equal(resolveReplyFrom(PRIMARY, headers, DEFAULT_SEND_AS), PRIMARY);
+    assert.equal(
+      resolveReplyFrom(`Jim <${PRIMARY}>`, headers, DEFAULT_SEND_AS),
+      PRIMARY
+    );
+  });
+
+  it("fails clearly when inferred address is not a sendAs alias", () => {
+    const headers = collectHeaders([
+      { name: "Delivered-To", value: "unknown@elsewhere.com" },
+      { name: "To", value: "Also Unknown <also@elsewhere.com>" },
+    ]);
+    assert.throws(
+      () => resolveReplyFrom(undefined, headers, DEFAULT_SEND_AS),
+      /not a sendAs alias.*Pass explicit from/
+    );
+    assert.throws(
+      () => resolveReplyFrom("not-an-alias@oberon.group", headers, DEFAULT_SEND_AS),
+      /not an allowed sendAs alias/
+    );
+  });
+
+  it("adds Re: when needed and builds In-Reply-To / References", () => {
+    assert.equal(replySubject("Load 1042"), "Re: Load 1042");
+    assert.equal(replySubject("Re: Load 1042"), "Re: Load 1042");
+    assert.equal(replySubject("RE: already"), "RE: already");
+    const threading = buildThreadingHeaders(
+      collectHeaders([
+        { name: "Message-ID", value: "<abc@carrier.com>" },
+        { name: "References", value: "<root@carrier.com>" },
+      ])
+    );
+    assert.equal(threading.inReplyTo, "<abc@carrier.com>");
+    assert.equal(threading.references, "<root@carrier.com> <abc@carrier.com>");
+  });
+
+  it("sets In-Reply-To, References, and threadId on messages.send", async () => {
+    const message = parentMessage([
+      { name: "Delivered-To", value: LOGISTICS },
+      { name: "To", value: `Jim Phillips <${LOGISTICS}>` },
+      { name: "From", value: "Carrier Ops <dispatch@carrier.com>" },
+      { name: "Subject", value: "Load 1042" },
+      { name: "Message-ID", value: "<abc@carrier.com>" },
+      { name: "References", value: "<root@carrier.com>" },
+    ]);
+    const { calls, fetchImpl } = mockReplyFetch({ message });
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+
+    const result = await client.replyAs({
+      messageId: "inbound-1",
+      body: "Confirmed, rolling.",
+    });
+
+    assert.deepEqual(result, { id: "reply-1", threadId: "thr-logistics" });
+    assert.equal(Object.keys(result).join(","), "id,threadId");
+
+    const getUrl = calls.find((c) => c.url.includes("/messages/inbound-1"));
+    assert.equal(getUrl.url, messageGetUrl("inbound-1"));
+
+    const send = calls.find((c) => c.url.includes("/messages/send"));
+    const inspected = inspectSendCall(send);
+    assert.equal(inspected.url, `${GMAIL_API}/users/me/messages/send`);
+    assert.equal(inspected.body.threadId, "thr-logistics");
+    assert.equal(Object.keys(inspected.body).sort().join(","), "raw,threadId");
+    assert.match(inspected.mime, /^From: jim\.phillips@oberonlogistics\.com\r$/m);
+    assert.match(inspected.mime, /^To: Carrier Ops <dispatch@carrier\.com>\r$/m);
+    assert.match(inspected.mime, /^Subject: Re: Load 1042\r$/m);
+    assert.match(inspected.mime, /^In-Reply-To: <abc@carrier\.com>\r$/m);
+    assert.match(
+      inspected.mime,
+      /^References: <root@carrier\.com> <abc@carrier\.com>\r$/m
+    );
+    assert.doesNotMatch(JSON.stringify(result), /test-access-token/);
+  });
+
+  it("explicit from wins on the wire even when Delivered-To would infer another alias", async () => {
+    const message = parentMessage([
+      { name: "Delivered-To", value: LOGISTICS },
+      { name: "From", value: "Broker <ap@broker.com>" },
+      { name: "Subject", value: "Re: Invoice" },
+      { name: "Message-ID", value: "<inv@broker.com>" },
+    ]);
+    const { calls, fetchImpl } = mockReplyFetch({ message });
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+
+    await client.replyAs({
+      messageId: "inbound-1",
+      from: PRIMARY,
+      html: "<p>Paid.</p>",
+    });
+
+    const send = calls.find((c) => c.url.includes("/messages/send"));
+    const inspected = inspectSendCall(send);
+    assert.match(inspected.mime, /^From: jim\.phillips@oberon\.group\r$/m);
+    assert.match(inspected.mime, /^Subject: Re: Invoice\r$/m);
+    assert.equal(inspected.body.threadId, "thr-logistics");
+  });
+
+  it("does not send when the landed address is not a sendAs alias", async () => {
+    const message = parentMessage([
+      { name: "Delivered-To", value: "random@elsewhere.com" },
+      { name: "To", value: "also@elsewhere.com" },
+      { name: "From", value: "Someone <a@b.com>" },
+      { name: "Subject", value: "Hi" },
+      { name: "Message-ID", value: "<x@y.com>" },
+    ]);
+    const { calls, fetchImpl } = mockReplyFetch({ message });
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+
+    await assert.rejects(
+      () => client.replyAs({ messageId: "inbound-1", body: "Nope" }),
+      /not a sendAs alias.*Pass explicit from/
+    );
+    assert.equal(calls.filter((c) => c.url.includes("/messages/send")).length, 0);
+  });
+
+  it("attaches files on reply using the same path/base64 shape as send_as", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gmail-reply-as-"));
+    const dest = path.join(dir, "invoice.PDF");
+    const pdf = Buffer.from("%PDF-1.4 reply-attach-bytes", "utf8");
+    await writeFile(dest, pdf);
+    const png = Buffer.from("\x89PNG reply-png", "binary");
+
+    const message = parentMessage([
+      { name: "Delivered-To", value: LOGISTICS },
+      { name: "From", value: "AP <ap@counterparty.com>" },
+      { name: "Subject", value: "Invoice 1042" },
+      { name: "Message-ID", value: "<inv@counterparty.com>" },
+    ]);
+    const { calls, fetchImpl } = mockReplyFetch({
+      message,
+      sendResult: { id: "reply-att", threadId: "thr-logistics" },
+    });
+
+    try {
+      const client = createGmailClient({
+        getAccessToken: async () => "test-access-token",
+        fetchImpl,
+      });
+      const result = await client.replyAs(
+        {
+          messageId: "inbound-1",
+          body: "Invoice attached.",
+          attachments: [
+            { path: dest },
+            {
+              filename: "stamp.png",
+              contentBase64: png.toString("base64"),
+            },
+          ],
+        },
+        { mixedBoundary: "mix_reply" }
+      );
+
+      assert.deepEqual(result, { id: "reply-att", threadId: "thr-logistics" });
+      const send = calls.find((c) => c.url.includes("/messages/send"));
+      const inspected = inspectSendCall(send);
+      assert.equal(inspected.body.threadId, "thr-logistics");
+      assert.match(inspected.mime, /Content-Type: multipart\/mixed; boundary="mix_reply"/);
+      assert.match(inspected.mime, /Content-Type: application\/pdf; name="invoice\.PDF"/);
+      assert.match(
+        inspected.mime,
+        /Content-Disposition: attachment; filename="invoice\.PDF"/
+      );
+      assert.match(inspected.mime, /Content-Disposition: attachment; filename="stamp\.png"/);
+      assert.match(
+        inspected.mime,
+        new RegExp(pdf.toString("base64").replace(/[+]/g, "\\+"))
+      );
+      assert.match(
+        inspected.mime,
+        new RegExp(png.toString("base64").replace(/[+]/g, "\\+"))
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
