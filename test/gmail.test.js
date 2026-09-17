@@ -1,17 +1,20 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
   buildRfc2822,
   createGmailClient,
   fromBase64Url,
+  inferMimeType,
   inspectSendCall,
   parseSendAsList,
   parseSendResult,
+  resolveSendAttachments,
   toBase64Url,
   GMAIL_API,
+  GMAIL_MAX_MESSAGE_BYTES,
 } from "../src/gmail.js";
 
 describe("list_send_as parsing", () => {
@@ -188,6 +191,231 @@ describe("send_as MIME + messages.send shape", () => {
       threadId: "t",
     });
     assert.throws(() => parseSendResult({}), /message id/);
+  });
+
+  it("send_as without attachments still posts the same raw MIME", async () => {
+    /** @type {{ url: string, init: RequestInit } | null} */
+    let captured = null;
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl: async (url, init) => {
+        captured = { url: String(url), init: init || {} };
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => ({ id: "plain-1" }),
+        });
+      },
+    });
+
+    const args = {
+      from: "ops@oberonlogistics.com",
+      to: "a@b.com",
+      subject: "No files",
+      body: "Just text",
+    };
+    const result = await client.sendAs(args);
+    assert.deepEqual(result, { id: "plain-1" });
+    const inspected = inspectSendCall(captured);
+    assert.doesNotMatch(inspected.mime, /multipart\/mixed/);
+    assert.doesNotMatch(inspected.mime, /Content-Disposition: attachment/);
+    assert.equal(inspected.body.raw, toBase64Url(buildRfc2822(args)));
+    assert.match(inspected.mime, /^Content-Type: text\/plain; charset="UTF-8"\r$/m);
+  });
+});
+
+describe("send_as outbound attachments", () => {
+  it("infers PDF/JPG/PNG mime types from extension", () => {
+    assert.equal(inferMimeType("invoice.PDF"), "application/pdf");
+    assert.equal(inferMimeType("pod.jpg"), "image/jpeg");
+    assert.equal(inferMimeType("scan.JPEG"), "image/jpeg");
+    assert.equal(inferMimeType("photo.png"), "image/png");
+    assert.equal(inferMimeType("notes.csv", "text/csv"), "text/csv");
+    assert.equal(inferMimeType("notes.csv"), "application/octet-stream");
+  });
+
+  it("multipart/mixed includes Content-Type and Content-Disposition filename", () => {
+    const pdf = Buffer.from("%PDF-1.4 mock-invoice-bytes", "utf8");
+    const mime = buildRfc2822(
+      {
+        from: "ops@oberonlogistics.com",
+        to: "ap@counterparty.com",
+        subject: "Invoice 1042",
+        body: "Please find the invoice attached.",
+        attachments: [
+          { filename: "invoice.PDF", mimeType: "application/pdf", bytes: pdf },
+        ],
+      },
+      { mixedBoundary: "mix_test" }
+    );
+
+    assert.match(mime, /Content-Type: multipart\/mixed; boundary="mix_test"/);
+    assert.match(mime, /Content-Type: application\/pdf; name="invoice\.PDF"/);
+    assert.match(
+      mime,
+      /Content-Disposition: attachment; filename="invoice\.PDF"/
+    );
+    assert.match(mime, /Content-Transfer-Encoding: base64/);
+    assert.match(mime, /Please find the invoice attached\./);
+    assert.match(mime, new RegExp(pdf.toString("base64").replace(/[+]/g, "\\+")));
+    assert.doesNotMatch(mime, /test-access-token/);
+  });
+
+  it("path-based attach reads file bytes into the MIME part", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gmail-sendas-out-"));
+    const dest = path.join(dir, "invoice.PDF");
+    const pdf = Buffer.from("%PDF-1.4 path-attach-bytes", "utf8");
+    await writeFile(dest, pdf);
+
+    /** @type {{ url: string, init: RequestInit } | null} */
+    let captured = null;
+    try {
+      const client = createGmailClient({
+        getAccessToken: async () => "test-access-token",
+        fetchImpl: async (url, init) => {
+          captured = { url: String(url), init: init || {} };
+          return /** @type {Response} */ ({
+            ok: true,
+            json: async () => ({ id: "msg-att", threadId: "thr-att" }),
+          });
+        },
+      });
+
+      const result = await client.sendAs(
+        {
+          from: "ops@oberonlogistics.com",
+          to: "ap@counterparty.com",
+          subject: "Invoice 1042",
+          body: "Attached.",
+          attachments: [{ path: dest }],
+        },
+        { mixedBoundary: "mix_path" }
+      );
+
+      assert.deepEqual(result, { id: "msg-att", threadId: "thr-att" });
+      const inspected = inspectSendCall(captured);
+      assert.equal(inspected.url, `${GMAIL_API}/users/me/messages/send`);
+      assert.match(inspected.mime, /Content-Type: application\/pdf; name="invoice\.PDF"/);
+      assert.match(
+        inspected.mime,
+        /Content-Disposition: attachment; filename="invoice\.PDF"/
+      );
+      assert.match(
+        inspected.mime,
+        new RegExp(pdf.toString("base64").replace(/[+]/g, "\\+"))
+      );
+
+      const resolved = await resolveSendAttachments([{ path: dest }]);
+      assert.equal(resolved[0].filename, "invoice.PDF");
+      assert.equal(resolved[0].mimeType, "application/pdf");
+      assert.deepEqual(resolved[0].bytes, pdf);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts contentBase64 (and content) fallback with filename + mimeType", async () => {
+    const jpg = Buffer.from("\xFF\xD8\xFF jpeg-bytes", "binary");
+    const png = Buffer.from("\x89PNG png-bytes", "binary");
+
+    /** @type {{ url: string, init: RequestInit } | null} */
+    let captured = null;
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl: async (url, init) => {
+        captured = { url: String(url), init: init || {} };
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => ({ id: "msg-b64", threadId: "thr-b64" }),
+        });
+      },
+    });
+
+    const result = await client.sendAs(
+      {
+        from: "ops@oberonlogistics.com",
+        to: "ops@example.com",
+        subject: "POD photos",
+        html: "<p>Photos attached.</p>",
+        attachments: [
+          {
+            filename: "pod.jpg",
+            mimeType: "image/jpeg",
+            contentBase64: jpg.toString("base64"),
+          },
+          {
+            filename: "stamp.png",
+            content: png.toString("base64"),
+          },
+        ],
+      },
+      { mixedBoundary: "mix_b64" }
+    );
+
+    assert.deepEqual(result, { id: "msg-b64", threadId: "thr-b64" });
+    const inspected = inspectSendCall(captured);
+    assert.match(inspected.mime, /Content-Type: image\/jpeg; name="pod\.jpg"/);
+    assert.match(inspected.mime, /Content-Disposition: attachment; filename="pod\.jpg"/);
+    assert.match(inspected.mime, /Content-Type: image\/png; name="stamp\.png"/);
+    assert.match(inspected.mime, /Content-Disposition: attachment; filename="stamp\.png"/);
+    assert.match(inspected.mime, new RegExp(jpg.toString("base64").replace(/[+]/g, "\\+")));
+    assert.match(inspected.mime, new RegExp(png.toString("base64").replace(/[+]/g, "\\+")));
+  });
+
+  it("rejects oversize messages before send and never echoes file bytes", async () => {
+    const marker = "SECRETFILEBYTES_should_never_appear_in_errors";
+    const huge = Buffer.alloc(GMAIL_MAX_MESSAGE_BYTES + 1, 0);
+    huge.write(marker, 0, "utf8");
+
+    let fetchCalls = 0;
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => ({ id: "should-not-send" }),
+        });
+      },
+    });
+
+    await assert.rejects(
+      () =>
+        client.sendAs({
+          from: "ops@oberonlogistics.com",
+          to: "a@b.com",
+          subject: "Too big",
+          body: "x",
+          attachments: [
+            { filename: "huge.bin", mimeType: "application/octet-stream", bytes: huge },
+          ],
+        }),
+      (err) => {
+        assert.match(err.message, /25MB/);
+        assert.doesNotMatch(err.message, new RegExp(marker));
+        assert.doesNotMatch(err.message, /SECRETFILEBYTES/);
+        assert.doesNotMatch(err.message, /test-access-token/);
+        return true;
+      }
+    );
+    assert.equal(fetchCalls, 0);
+
+    assert.throws(
+      () =>
+        buildRfc2822({
+          from: "ops@oberonlogistics.com",
+          to: "a@b.com",
+          subject: "Too big",
+          body: "x",
+          attachments: [
+            { filename: "huge.bin", mimeType: "application/octet-stream", bytes: huge },
+          ],
+        }),
+      (err) => {
+        assert.match(err.message, /25MB/);
+        assert.doesNotMatch(err.message, new RegExp(marker));
+        return true;
+      }
+    );
   });
 });
 

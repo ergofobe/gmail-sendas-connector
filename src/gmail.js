@@ -21,6 +21,18 @@
  * @property {string} [filename]
  * @property {string} [path] disk path when a write was requested
  *
+ * @typedef {object} SendAttachmentInput
+ * @property {string} [path] local file path (preferred)
+ * @property {string} [filename] override of the recipient-visible name
+ * @property {string} [mimeType] inferred from extension for pdf/jpg/jpeg/png
+ * @property {string} [contentBase64] standard (or base64url) file bytes
+ * @property {string} [content] alias of contentBase64
+ *
+ * @typedef {object} ResolvedAttachment
+ * @property {string} filename
+ * @property {string} mimeType
+ * @property {Buffer} bytes
+ *
  * @typedef {object} SendAsArgs
  * @property {string} from sendAs alias email (becomes the From header)
  * @property {string} to
@@ -29,15 +41,26 @@
  * @property {string} [html] HTML body (used with or instead of body)
  * @property {string} [cc]
  * @property {string} [bcc]
+ * @property {SendAttachmentInput[]|SendAttachmentInput|ResolvedAttachment[]} [attachments]
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile, stat } from "node:fs/promises";
+import { mkdir, readFile, writeFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { requireCreds, safeErrorMessage } from "./secrets.js";
 
 export const GMAIL_API = "https://gmail.googleapis.com/gmail/v1";
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
+
+/** Gmail combined message size limit (headers + body + encoded attachments). */
+export const GMAIL_MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+
+const PRIMARY_MIME_BY_EXT = {
+  ".pdf": "application/pdf",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+};
 
 const SEND_ENDPOINT = `${GMAIL_API}/users/me/messages/send`;
 const SEND_AS_ENDPOINT = `${GMAIL_API}/users/me/settings/sendAs`;
@@ -134,9 +157,271 @@ export function encodeSubject(subject) {
 }
 
 /**
- * Build an RFC2822 MIME message. From is set to the sendAs alias email.
- * @param {SendAsArgs} args
+ * Infer or validate a MIME type. First-class: PDF, JPG/JPEG, PNG.
+ * @param {string} [filename]
+ * @param {string} [explicit]
+ * @returns {string}
+ */
+export function inferMimeType(filename, explicit) {
+  if (explicit != null && String(explicit).trim() !== "") {
+    const mimeType = String(explicit).trim();
+    assertMimeType(mimeType);
+    return mimeType;
+  }
+  const ext = path.extname(String(filename || "")).toLowerCase();
+  if (PRIMARY_MIME_BY_EXT[ext]) return PRIMARY_MIME_BY_EXT[ext];
+  if (filename) return "application/octet-stream";
+  throw new Error("mimeType is required when it cannot be inferred from filename");
+}
+
+/**
+ * @param {string} mimeType
+ */
+function assertMimeType(mimeType) {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9!#$&\-^_.+]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&\-^_.+]{0,126}$/.test(
+      mimeType
+    )
+  ) {
+    throw new Error("Invalid mimeType");
+  }
+}
+
+/**
+ * Recipient-visible filename only (basename, no CR/LF/quotes).
+ * @param {string} name
+ * @returns {string}
+ */
+export function sanitizeAttachmentFilename(name) {
+  const base = path.posix.basename(String(name || "").replace(/\\/g, "/")).trim();
+  if (!base || base === "." || base === "..") {
+    throw new Error("Attachment filename is required");
+  }
+  if (/[\r\n"]/.test(base)) {
+    throw new Error("Invalid attachment filename");
+  }
+  return base;
+}
+
+/**
+ * Decode standard or base64url attachment bytes. Never echoes the payload.
+ * @param {string} encoded
+ * @returns {Buffer}
+ */
+export function decodeAttachmentContent(encoded) {
+  if (typeof encoded !== "string" || encoded.trim() === "") {
+    throw new Error("Attachment content is empty");
+  }
+  const compact = encoded.replace(/\s+/g, "");
+  const normalized = compact.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const bytes = Buffer.from(padded, "base64");
+  if (bytes.length === 0) {
+    throw new Error("Attachment content is not valid base64");
+  }
+  return bytes;
+}
+
+/**
+ * @param {unknown} attachments
+ * @returns {unknown[]}
+ */
+function asAttachmentList(attachments) {
+  if (attachments == null || attachments === "") return [];
+  if (Array.isArray(attachments)) return attachments;
+  return [attachments];
+}
+
+/**
+ * Read path-based attachments and decode base64 fallbacks.
+ * Errors mention filename/code only — never file bytes or OAuth tokens.
+ * @param {unknown} attachments
+ * @returns {Promise<ResolvedAttachment[]>}
+ */
+export async function resolveSendAttachments(attachments) {
+  const list = asAttachmentList(attachments);
+  /** @type {ResolvedAttachment[]} */
+  const resolved = [];
+
+  for (const raw of list) {
+    if (!raw || typeof raw !== "object") {
+      throw new Error("Each attachment must be an object with path or contentBase64");
+    }
+    const destPath =
+      raw.path != null && String(raw.path).trim() !== ""
+        ? String(raw.path).trim()
+        : "";
+    const encoded = raw.contentBase64 ?? raw.content;
+    let filename = raw.filename != null ? String(raw.filename).trim() : "";
+    /** @type {Buffer} */
+    let bytes;
+
+    if (destPath) {
+      if (!filename) filename = path.basename(destPath);
+      try {
+        bytes = await readFile(destPath);
+      } catch (err) {
+        const code = err && typeof err === "object" && "code" in err && err.code
+          ? ` (${err.code})`
+          : "";
+        let label = "attachment";
+        try {
+          label = sanitizeAttachmentFilename(filename || path.basename(destPath));
+        } catch {
+          // keep generic label
+        }
+        throw new Error(`Cannot read attachment file ${label}${code}`);
+      }
+    } else if (Buffer.isBuffer(raw.bytes)) {
+      bytes = raw.bytes;
+      if (!filename) {
+        throw new Error("filename is required when attaching file bytes");
+      }
+    } else if (encoded != null && String(encoded).length > 0) {
+      bytes = decodeAttachmentContent(String(encoded));
+      if (!filename) {
+        throw new Error("filename is required when attaching via contentBase64/content");
+      }
+    } else {
+      throw new Error("Each attachment needs a local file path or contentBase64/content");
+    }
+
+    const mimeType = inferMimeType(filename, raw.mimeType);
+    resolved.push({
+      filename: sanitizeAttachmentFilename(filename),
+      mimeType,
+      bytes,
+    });
+  }
+
+  return resolved;
+}
+
+/**
+ * @param {unknown} att
+ * @returns {ResolvedAttachment}
+ */
+function coerceResolvedAttachment(att) {
+  if (!att || typeof att !== "object") {
+    throw new Error("Each attachment must be an object with path or contentBase64");
+  }
+  if (Buffer.isBuffer(att.bytes)) {
+    const filename = sanitizeAttachmentFilename(
+      att.filename || (att.path ? path.basename(String(att.path)) : "")
+    );
+    return {
+      filename,
+      mimeType: inferMimeType(filename, att.mimeType),
+      bytes: att.bytes,
+    };
+  }
+  if (att.contentBase64 != null || att.content != null) {
+    const filename = sanitizeAttachmentFilename(att.filename || "");
+    return {
+      filename,
+      mimeType: inferMimeType(filename, att.mimeType),
+      bytes: decodeAttachmentContent(String(att.contentBase64 ?? att.content)),
+    };
+  }
+  throw new Error("Attachment path must be resolved before building MIME");
+}
+
+/**
+ * @param {ResolvedAttachment[]} attachments
+ */
+function assertAttachmentsFit(attachments) {
+  let total = 0;
+  for (const att of attachments) {
+    total += att.bytes.length;
+    if (total > GMAIL_MAX_MESSAGE_BYTES) {
+      throw new Error(
+        `Message exceeds Gmail's ~25MB combined size limit (${GMAIL_MAX_MESSAGE_BYTES} bytes). Remove or shrink attachments.`
+      );
+    }
+  }
+}
+
+/**
+ * @param {string} mime
+ */
+export function assertWithinGmailSize(mime) {
+  const size = Buffer.byteLength(mime, "utf8");
+  if (size > GMAIL_MAX_MESSAGE_BYTES) {
+    throw new Error(
+      `Message is ${size} bytes and exceeds Gmail's ~25MB combined size limit (${GMAIL_MAX_MESSAGE_BYTES} bytes). Remove or shrink attachments.`
+    );
+  }
+}
+
+/**
+ * @param {Buffer} bytes
+ * @returns {string}
+ */
+function foldBase64(bytes) {
+  const b64 = bytes.toString("base64");
+  return b64.replace(/(.{76})/g, "$1\r\n").replace(/\r\n$/, "");
+}
+
+/**
+ * @param {string} text
+ * @param {string} html
  * @param {{ boundary?: string }} [opts]
+ * @returns {string}
+ */
+function buildBodyEntity(text, html, opts = {}) {
+  if (text && html) {
+    const boundary = opts.boundary || `alt_${randomBytes(12).toString("hex")}`;
+    return [
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      "",
+      `--${boundary}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      text,
+      `--${boundary}`,
+      'Content-Type: text/html; charset="UTF-8"',
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      html,
+      `--${boundary}--`,
+    ].join("\r\n");
+  }
+  if (html) {
+    return [
+      'Content-Type: text/html; charset="UTF-8"',
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      html,
+    ].join("\r\n");
+  }
+  return [
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: 8bit",
+    "",
+    text,
+  ].join("\r\n");
+}
+
+/**
+ * @param {ResolvedAttachment} att
+ * @returns {string}
+ */
+function buildAttachmentEntity(att) {
+  return [
+    `Content-Type: ${att.mimeType}; name="${att.filename}"`,
+    `Content-Disposition: attachment; filename="${att.filename}"`,
+    "Content-Transfer-Encoding: base64",
+    "",
+    foldBase64(att.bytes),
+  ].join("\r\n");
+}
+
+/**
+ * Build an RFC2822 MIME message. From is set to the sendAs alias email.
+ * With attachments, uses multipart/mixed (body + attachment parts).
+ * @param {SendAsArgs} args
+ * @param {{ boundary?: string, mixedBoundary?: string, altBoundary?: string }} [opts]
  * @returns {string}
  */
 export function buildRfc2822(args, opts = {}) {
@@ -160,6 +445,9 @@ export function buildRfc2822(args, opts = {}) {
   assertSingleLine("cc", args.cc);
   assertSingleLine("bcc", args.bcc);
 
+  const attachments = asAttachmentList(args.attachments).map(coerceResolvedAttachment);
+  assertAttachmentsFit(attachments);
+
   const headers = [
     `From: ${from}`,
     `To: ${normalizeAddrs(to)}`,
@@ -169,36 +457,64 @@ export function buildRfc2822(args, opts = {}) {
   headers.push(`Subject: ${encodeSubject(subject)}`);
   headers.push("MIME-Version: 1.0");
 
-  if (text && html) {
-    const boundary = opts.boundary || `ss_${randomBytes(12).toString("hex")}`;
-    headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
-    return [
-      ...headers,
-      "",
-      `--${boundary}`,
-      'Content-Type: text/plain; charset="UTF-8"',
-      "Content-Transfer-Encoding: 8bit",
-      "",
-      text,
-      `--${boundary}`,
-      'Content-Type: text/html; charset="UTF-8"',
-      "Content-Transfer-Encoding: 8bit",
-      "",
-      html,
-      `--${boundary}--`,
-      "",
-    ].join("\r\n");
-  }
+  if (attachments.length === 0) {
+    if (text && html) {
+      const boundary = opts.boundary || `ss_${randomBytes(12).toString("hex")}`;
+      headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
+      const mime = [
+        ...headers,
+        "",
+        `--${boundary}`,
+        'Content-Type: text/plain; charset="UTF-8"',
+        "Content-Transfer-Encoding: 8bit",
+        "",
+        text,
+        `--${boundary}`,
+        'Content-Type: text/html; charset="UTF-8"',
+        "Content-Transfer-Encoding: 8bit",
+        "",
+        html,
+        `--${boundary}--`,
+        "",
+      ].join("\r\n");
+      assertWithinGmailSize(mime);
+      return mime;
+    }
 
-  if (html) {
-    headers.push('Content-Type: text/html; charset="UTF-8"');
+    if (html) {
+      headers.push('Content-Type: text/html; charset="UTF-8"');
+      headers.push("Content-Transfer-Encoding: 8bit");
+      const mime = [...headers, "", html, ""].join("\r\n");
+      assertWithinGmailSize(mime);
+      return mime;
+    }
+
+    headers.push('Content-Type: text/plain; charset="UTF-8"');
     headers.push("Content-Transfer-Encoding: 8bit");
-    return [...headers, "", html, ""].join("\r\n");
+    const mime = [...headers, "", text, ""].join("\r\n");
+    assertWithinGmailSize(mime);
+    return mime;
   }
 
-  headers.push('Content-Type: text/plain; charset="UTF-8"');
-  headers.push("Content-Transfer-Encoding: 8bit");
-  return [...headers, "", text, ""].join("\r\n");
+  const mixedBoundary =
+    opts.mixedBoundary || opts.boundary || `mix_${randomBytes(12).toString("hex")}`;
+  headers.push(`Content-Type: multipart/mixed; boundary="${mixedBoundary}"`);
+
+  const parts = [
+    buildBodyEntity(text, html, { boundary: opts.altBoundary }),
+    ...attachments.map(buildAttachmentEntity),
+  ];
+
+  const mime = [
+    ...headers,
+    "",
+    ...parts.flatMap((part) => [`--${mixedBoundary}`, part]),
+    `--${mixedBoundary}--`,
+    "",
+  ].join("\r\n");
+
+  assertWithinGmailSize(mime);
+  return mime;
 }
 
 /**
@@ -305,11 +621,12 @@ export function createGmailClient({
     /**
      * POST users.messages.send with RFC2822 raw (base64url).
      * @param {SendAsArgs} args
-     * @param {{ boundary?: string }} [mimeOpts]
+     * @param {{ boundary?: string, mixedBoundary?: string, altBoundary?: string }} [mimeOpts]
      * @returns {Promise<SendResult>}
      */
     async sendAs(args, mimeOpts) {
-      const mime = buildRfc2822(args, mimeOpts);
+      const attachments = await resolveSendAttachments(args.attachments);
+      const mime = buildRfc2822({ ...args, attachments }, mimeOpts);
       const payload = await gmailFetch(SEND_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

@@ -1,8 +1,8 @@
 {
   "name": "gmail-sendas",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Cursor plugin: Gmail sendAs + attachment bytes (complements stock Gmail MCP)",
+  "description": "Cursor plugin: Gmail sendAs + inbound/outbound attachments (complements stock Gmail MCP)",
   "type": "module",
   "engines": {
     "node": ">=18"

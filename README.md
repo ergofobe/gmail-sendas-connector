@@ -2,7 +2,7 @@
 
 Cursor plugin (**Gmail sendAs + attachments**) that fills two gaps in the stock Gmail MCP:
 
-1. **From / sendAs** — send mail as a verified Workspace alias
+1. **From / sendAs** — send mail as a verified Workspace alias, including **attach-on-send** for outbound PDFs/images
 2. **Attachment bytes** — download inbound file data the stock connector cannot return
 
 Keep **stock Gmail MCP** for inbox search, labels, and triage. This plugin is not a Gmail replacement.
@@ -34,10 +34,52 @@ No rules, hooks, agents, or commands.
 | Tool | API | Returns |
 | --- | --- | --- |
 | `list_send_as` | `GET https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs` | `SendAs[]` |
-| `send_as` | `POST .../users/me/messages/send` with RFC2822 MIME `raw` (base64url) | `SendResult` (`id`, optional `threadId`) only |
+| `send_as` | `POST .../users/me/messages/send` with RFC2822 MIME `raw` (base64url); optional outbound attachments as multipart/mixed | `SendResult` (`id`, optional `threadId`) only |
 | `get_attachment` | `GET .../users/me/messages/{messageId}/attachments/{attachmentId}` | `AttachmentBody`; writes a file when `path` is set |
 
-`send_as` required arguments: `from` (sendAs alias email), `to`, `subject`, and `body` (plain text) and/or `html`. Optional: `cc`, `bcc`. The From header is set to the alias.
+`send_as` required arguments: `from` (sendAs alias email), `to`, `subject`, and `body` (plain text) and/or `html`. Optional: `cc`, `bcc`, `attachments`. The From header is set to the alias.
+
+**Attach-on-send** (when the caller already has a local file and must send From an alias — do not fall back to the Gmail compose UI):
+
+- Preferred: `{ path }` (e.g. `/workspace/outbox/invoice.PDF`), plus optional `filename` and `mimeType`
+- Fallback: `{ contentBase64 }` (or `content`) + `filename` + `mimeType`
+- First-class types: **PDF, JPG/JPEG, PNG**. `mimeType` is inferred from those extensions when omitted; other types are fine if `mimeType` is provided
+- Combined RFC2822 message (headers + body + encoded attachments) must be under Gmail's **~25MB** limit; oversize is rejected before `messages.send`
+- Return value is still `{ id, threadId }` only — never tokens or file bytes
+
+Example call shape for agents (Consola / Inbox):
+
+```json
+{
+  "from": "ops@oberonlogistics.com",
+  "to": "ap@counterparty.com",
+  "subject": "Invoice 1042",
+  "body": "Please find the invoice attached.",
+  "attachments": [
+    { "path": "/workspace/outbox/invoice.PDF" }
+  ]
+}
+```
+
+Base64 fallback when no local path is available:
+
+```json
+{
+  "from": "ops@oberonlogistics.com",
+  "to": "ap@counterparty.com",
+  "subject": "Signed rate con",
+  "html": "<p>Signed copy attached.</p>",
+  "attachments": [
+    {
+      "filename": "rate-con.pdf",
+      "mimeType": "application/pdf",
+      "contentBase64": "<standard-base64-bytes>"
+    }
+  ]
+}
+```
+
+After merge, **restart / reinstall the MCP server** for Grok Bot stdio installs. Tool schemas are loaded at process start (`tools/list` from `TOOL_DEFS`); an already-running stdio process will not advertise `attachments` until it is restarted.
 
 OAuth tokens are never returned or logged.
 
@@ -46,6 +88,7 @@ OAuth tokens are never returned or logged.
 ```js
 /** @typedef {{ sendAsEmail: string, displayName?: string, isPrimary?: boolean, isDefault?: boolean, verificationStatus?: string }} SendAs */
 /** @typedef {{ id: string, threadId?: string }} SendResult */
+/** @typedef {{ path?: string, filename?: string, mimeType?: string, contentBase64?: string, content?: string }} SendAttachment */
 /** @typedef {{ size: number, data: string, attachmentId: string, filename?: string, path?: string }} AttachmentBody */
 ```
 
@@ -110,8 +153,9 @@ Requires Node 18+. Coverage (all mocked):
 
 - `list_send_as` response parsing
 - `send_as` builds the From header and `users.messages.send` `{ raw }` body
+- `send_as` attachments: multipart/mixed Content-Type / Content-Disposition, path read, base64 fallback, ~25MB oversize reject; no-attachment MIME unchanged
 - `get_attachment` decodes base64url and writes a file of the expected byte length
-- Missing-credential / refresh errors never echo secrets
+- Missing-credential / refresh errors never echo secrets or file contents
 
 ## Live demo (after Jim finishes auth)
 
@@ -133,7 +177,6 @@ Always prefer `list_send_as` over hardcoding addresses.
 
 - Full Gmail replacement (filters, drafts UI, label management)
 - Calendar
-- Sending outbound file attachments (inbound download only)
 - Cursor Marketplace publish — **owner decides later**
 
 ## License

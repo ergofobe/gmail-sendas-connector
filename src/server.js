@@ -7,7 +7,7 @@ import { createGmailClient, createTokenSource } from "./gmail.js";
 import { missingOAuthVars, safeErrorMessage } from "./secrets.js";
 
 export const PROTOCOL_VERSION = "2025-03-26";
-export const SERVER_INFO = { name: "gmail-sendas", version: "1.0.0" };
+export const SERVER_INFO = { name: "gmail-sendas", version: "1.1.0" };
 
 export const TOOL_DEFS = [
   {
@@ -23,7 +23,7 @@ export const TOOL_DEFS = [
   {
     name: "send_as",
     description:
-      "Send mail From a Workspace sendAs alias via users.messages.send (RFC2822 MIME raw, base64url). Required: from (alias email), to, subject, and body text and/or html. Optional: cc, bcc. Returns message id (and threadId) only — never tokens.",
+      "Send mail From a Workspace sendAs alias via users.messages.send (RFC2822 MIME raw, base64url). Required: from (alias email), to, subject, and body text and/or html. Optional: cc, bcc, attachments (local path preferred; contentBase64 fallback). First-class attach types: PDF, JPG/JPEG, PNG. Combined message must be under ~25MB. Returns message id (and threadId) only — never tokens or file bytes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -43,6 +43,40 @@ export const TOOL_DEFS = [
         },
         cc: { type: "string" },
         bcc: { type: "string" },
+        attachments: {
+          type: "array",
+          description:
+            "Outbound files to attach (multipart/mixed). Prefer local path; otherwise contentBase64/content + filename + mimeType. mimeType is inferred from .pdf/.jpg/.jpeg/.png when omitted. Rejected if the combined MIME exceeds Gmail's ~25MB limit.",
+          items: {
+            type: "object",
+            properties: {
+              path: {
+                type: "string",
+                description:
+                  "Local file path (preferred), e.g. /workspace/outbox/invoice.PDF",
+              },
+              filename: {
+                type: "string",
+                description:
+                  "Recipient-visible filename; defaults to the path basename",
+              },
+              mimeType: {
+                type: "string",
+                description:
+                  "MIME type. Inferred from extension for pdf/jpg/jpeg/png; required (or application/octet-stream) for other types",
+              },
+              contentBase64: {
+                type: "string",
+                description:
+                  "Standard base64 of the file bytes when no local path is available",
+              },
+              content: {
+                type: "string",
+                description: "Alias of contentBase64",
+              },
+            },
+          },
+        },
       },
       required: ["from", "to", "subject"],
     },
@@ -103,6 +137,7 @@ export function createToolRunner({
           html: /** @type {string|undefined} */ (args.html),
           cc: /** @type {string|undefined} */ (args.cc),
           bcc: /** @type {string|undefined} */ (args.bcc),
+          attachments: args.attachments,
         });
       case "get_attachment":
         return gmail.getAttachment({
