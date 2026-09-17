@@ -1,19 +1,54 @@
 /**
  * Minimal stdio MCP (newline-delimited JSON-RPC 2.0).
- * No @modelcontextprotocol/sdk — three tools do not need the extra surface.
+ * No @modelcontextprotocol/sdk — four tools do not need the extra surface.
  */
 
 import { createGmailClient, createTokenSource } from "./gmail.js";
 import { missingOAuthVars, safeErrorMessage } from "./secrets.js";
 
 export const PROTOCOL_VERSION = "2025-03-26";
-export const SERVER_INFO = { name: "gmail-sendas", version: "1.0.0" };
+export const SERVER_INFO = { name: "gmail-sendas", version: "1.2.0" };
+
+const ATTACHMENT_ITEMS_SCHEMA = {
+  type: "array",
+  description:
+    "Outbound files to attach (multipart/mixed). Prefer local path; otherwise contentBase64/content + filename + mimeType. mimeType is inferred from .pdf/.jpg/.jpeg/.png when omitted. Rejected if the combined MIME exceeds Gmail's ~25MB limit.",
+  items: {
+    type: "object",
+    properties: {
+      path: {
+        type: "string",
+        description:
+          "Local file path (preferred), e.g. /workspace/outbox/invoice.PDF",
+      },
+      filename: {
+        type: "string",
+        description:
+          "Recipient-visible filename; defaults to the path basename",
+      },
+      mimeType: {
+        type: "string",
+        description:
+          "MIME type. Inferred from extension for pdf/jpg/jpeg/png; required (or application/octet-stream) for other types",
+      },
+      contentBase64: {
+        type: "string",
+        description:
+          "Standard base64 of the file bytes when no local path is available",
+      },
+      content: {
+        type: "string",
+        description: "Alias of contentBase64",
+      },
+    },
+  },
+};
 
 export const TOOL_DEFS = [
   {
     name: "list_send_as",
     description:
-      "List Gmail sendAs aliases (GET users.me.settings.sendAs). Use this plugin only for sendAs + attachment bytes. Use stock Gmail MCP for inbox search, labels, and triage.",
+      "List Gmail sendAs aliases (GET users.me.settings.sendAs). Use this plugin only for sendAs + in-thread reply_as + attachment bytes. Use stock Gmail MCP for inbox search, labels, and triage.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -23,7 +58,7 @@ export const TOOL_DEFS = [
   {
     name: "send_as",
     description:
-      "Send mail From a Workspace sendAs alias via users.messages.send (RFC2822 MIME raw, base64url). Required: from (alias email), to, subject, and body text and/or html. Optional: cc, bcc. Returns message id (and threadId) only — never tokens.",
+      "Send a new message From a Workspace sendAs alias via users.messages.send (RFC2822 MIME raw, base64url). Required: from (alias email), to, subject, and body text and/or html. Optional: cc, bcc, attachments (local path preferred; contentBase64 fallback). First-class attach types: PDF, JPG/JPEG, PNG. Combined message must be under ~25MB. Returns message id (and threadId) only — never tokens or file bytes. For in-thread replies that must From the landed alias, use reply_as instead of stock Gmail reply.",
     inputSchema: {
       type: "object",
       properties: {
@@ -43,8 +78,53 @@ export const TOOL_DEFS = [
         },
         cc: { type: "string" },
         bcc: { type: "string" },
+        attachments: ATTACHMENT_ITEMS_SCHEMA,
       },
       required: ["from", "to", "subject"],
+    },
+  },
+  {
+    name: "reply_as",
+    description:
+      "Reply in an existing Gmail thread From the address the mail landed on (or an explicit sendAs alias). Required: messageId (inbound Gmail message to reply to) and body and/or html. Optional: threadId (defaults to the parent message threadId), from, to, cc, bcc, replyAll, attachments (same shape as send_as). From resolution: explicit from if provided (must be a sendAs alias); else first of Delivered-To, X-Original-To, To that matches a sendAs alias (case-insensitive). Sends via users.messages.send with threadId plus In-Reply-To/References. Returns { id, threadId } only. Use instead of stock Gmail reply when the inbound landed on an alias (e.g. logistics) rather than the primary mailbox.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: {
+          type: "string",
+          description:
+            "Required. Gmail id of the inbound message to reply to. threadId is optional and is taken from this message when omitted.",
+        },
+        threadId: {
+          type: "string",
+          description:
+            "Optional Gmail thread id. If omitted, uses the parent message's threadId so the reply stays in-thread.",
+        },
+        from: {
+          type: "string",
+          description:
+            "Optional Workspace sendAs alias. If omitted, inferred from the inbound Delivered-To, then X-Original-To, then To (first that matches a sendAs alias, case-insensitive).",
+        },
+        to: {
+          type: "string",
+          description:
+            "Optional. Defaults to the parent Reply-To or From (reply-to-sender).",
+        },
+        cc: { type: "string" },
+        bcc: { type: "string" },
+        replyAll: {
+          type: "boolean",
+          description:
+            "If true and cc is omitted, Cc the original To/Cc except our sendAs address and the To recipient.",
+        },
+        body: { type: "string", description: "Plain-text body" },
+        html: {
+          type: "string",
+          description: "HTML body (with or instead of body)",
+        },
+        attachments: ATTACHMENT_ITEMS_SCHEMA,
+      },
+      required: ["messageId"],
     },
   },
   {
@@ -103,6 +183,20 @@ export function createToolRunner({
           html: /** @type {string|undefined} */ (args.html),
           cc: /** @type {string|undefined} */ (args.cc),
           bcc: /** @type {string|undefined} */ (args.bcc),
+          attachments: args.attachments,
+        });
+      case "reply_as":
+        return gmail.replyAs({
+          messageId: /** @type {string} */ (args.messageId),
+          threadId: /** @type {string|undefined} */ (args.threadId),
+          from: /** @type {string|undefined} */ (args.from),
+          to: /** @type {string|undefined} */ (args.to),
+          cc: /** @type {string|undefined} */ (args.cc),
+          bcc: /** @type {string|undefined} */ (args.bcc),
+          replyAll: args.replyAll === true || args.replyAll === "true",
+          body: /** @type {string|undefined} */ (args.body),
+          html: /** @type {string|undefined} */ (args.html),
+          attachments: args.attachments,
         });
       case "get_attachment":
         return gmail.getAttachment({

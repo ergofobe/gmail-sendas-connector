@@ -1,10 +1,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createMessageHandler, createStdioParser, TOOL_DEFS } from "../src/server.js";
+import {
+  createMessageHandler,
+  createStdioParser,
+  createToolRunner,
+  TOOL_DEFS,
+} from "../src/server.js";
+import { inspectSendCall } from "../src/gmail.js";
 import { buildAuthUrl, exchangeCode, OAUTH_SCOPES } from "../scripts/oauth-setup.js";
 
 describe("MCP surface", () => {
-  it("lists exactly the three gap tools", async () => {
+  it("lists exactly the four gap tools", async () => {
     const handle = createMessageHandler({
       runTool: async () => {
         throw new Error("should not run");
@@ -12,8 +18,22 @@ describe("MCP surface", () => {
     });
     const listed = await handle({ jsonrpc: "2.0", id: 1, method: "tools/list" });
     const names = listed.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["get_attachment", "list_send_as", "send_as"]);
-    assert.equal(TOOL_DEFS.length, 3);
+    assert.deepEqual(names, ["get_attachment", "list_send_as", "reply_as", "send_as"]);
+    assert.equal(TOOL_DEFS.length, 4);
+    const sendAs = listed.result.tools.find((t) => t.name === "send_as");
+    assert.ok(sendAs.inputSchema.properties.attachments);
+    assert.ok(sendAs.inputSchema.properties.attachments.items.properties.path);
+    assert.ok(sendAs.inputSchema.properties.attachments.items.properties.contentBase64);
+    assert.deepEqual(sendAs.inputSchema.required, ["from", "to", "subject"]);
+    const replyAs = listed.result.tools.find((t) => t.name === "reply_as");
+    assert.deepEqual(replyAs.inputSchema.required, ["messageId"]);
+    assert.ok(replyAs.inputSchema.properties.from);
+    assert.ok(replyAs.inputSchema.properties.replyAll);
+    assert.ok(replyAs.inputSchema.properties.attachments);
+    assert.ok(replyAs.inputSchema.properties.attachments.items.properties.path);
+    assert.ok(replyAs.inputSchema.properties.attachments.items.properties.contentBase64);
+    const getAtt = listed.result.tools.find((t) => t.name === "get_attachment");
+    assert.deepEqual(getAtt.inputSchema.required, ["messageId", "attachmentId"]);
   });
 
   it("initialize and tools/call return JSON-RPC results", async () => {
@@ -21,6 +41,7 @@ describe("MCP surface", () => {
       runTool: async (name, args) => {
         assert.equal(name, "send_as");
         assert.equal(args.from, "ops@oberonlogistics.com");
+        assert.equal(args.attachments, undefined);
         return { id: "mid", threadId: "tid" };
       },
     });
@@ -51,6 +72,33 @@ describe("MCP surface", () => {
       id: "mid",
       threadId: "tid",
     });
+
+    const withAtt = createMessageHandler({
+      runTool: async (name, args) => {
+        assert.equal(name, "send_as");
+        assert.deepEqual(args.attachments, [{ path: "/workspace/outbox/invoice.PDF" }]);
+        return { id: "mid2", threadId: "tid2" };
+      },
+    });
+    const attached = await withAtt({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "send_as",
+        arguments: {
+          from: "ops@oberonlogistics.com",
+          to: "a@b.com",
+          subject: "Invoice",
+          body: "Attached.",
+          attachments: [{ path: "/workspace/outbox/invoice.PDF" }],
+        },
+      },
+    });
+    assert.deepEqual(JSON.parse(attached.result.content[0].text), {
+      id: "mid2",
+      threadId: "tid2",
+    });
   });
 
   it("parses Content-Length and newline frames", () => {
@@ -62,6 +110,136 @@ describe("MCP surface", () => {
     assert.equal(messages.length, 2);
     assert.equal(messages[0].id, 1);
     assert.equal(messages[1].id, 2);
+  });
+});
+
+describe("createToolRunner send_as wiring", () => {
+  it("forwards attachments into sendAs and returns id + threadId only", async () => {
+    const png = Buffer.from("png-runner-bytes", "utf8");
+    /** @type {{ url: string, init: RequestInit } | null} */
+    let captured = null;
+    const runTool = createToolRunner({
+      env: {
+        GOOGLE_CLIENT_ID: "client.apps.googleusercontent.com",
+        GOOGLE_CLIENT_SECRET: "not-used-because-token-source-not-hit",
+        GOOGLE_REFRESH_TOKEN: "not-used",
+      },
+      fetchImpl: async (url, init) => {
+        if (String(url).includes("oauth2.googleapis.com/token")) {
+          return /** @type {Response} */ ({
+            ok: true,
+            json: async () => ({ access_token: "tok", expires_in: 3600 }),
+          });
+        }
+        captured = { url: String(url), init: init || {} };
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => ({
+            id: "runner-id",
+            threadId: "runner-thr",
+            labelIds: ["SENT"],
+            raw: "must-not-return",
+          }),
+        });
+      },
+    });
+
+    const result = await runTool("send_as", {
+      from: "ops@oberonlogistics.com",
+      to: "a@b.com",
+      subject: "Runner attach",
+      body: "See file.",
+      attachments: [
+        { filename: "stamp.png", contentBase64: png.toString("base64") },
+      ],
+    });
+    assert.deepEqual(result, { id: "runner-id", threadId: "runner-thr" });
+    const inspected = inspectSendCall(captured);
+    assert.match(inspected.mime, /Content-Type: image\/png; name="stamp\.png"/);
+    assert.match(inspected.mime, /Content-Disposition: attachment; filename="stamp\.png"/);
+    assert.doesNotMatch(JSON.stringify(result), /must-not-return/);
+    assert.doesNotMatch(JSON.stringify(result), /png-runner-bytes/);
+  });
+});
+
+describe("createToolRunner reply_as wiring", () => {
+  it("forwards messageId + attachments and returns id + threadId only", async () => {
+    const pdf = Buffer.from("%PDF-1.4 runner-reply", "utf8");
+    /** @type {{ url: string, init: RequestInit }[]} */
+    const calls = [];
+    const runTool = createToolRunner({
+      env: {
+        GOOGLE_CLIENT_ID: "client.apps.googleusercontent.com",
+        GOOGLE_CLIENT_SECRET: "not-used-because-token-source-not-hit",
+        GOOGLE_REFRESH_TOKEN: "not-used",
+      },
+      fetchImpl: async (url, init) => {
+        const u = String(url);
+        if (u.includes("oauth2.googleapis.com/token")) {
+          return /** @type {Response} */ ({
+            ok: true,
+            json: async () => ({ access_token: "tok", expires_in: 3600 }),
+          });
+        }
+        calls.push({ url: u, init: init || {} });
+        if (u.includes("/settings/sendAs")) {
+          return /** @type {Response} */ ({
+            ok: true,
+            json: async () => ({
+              sendAs: [
+                {
+                  sendAsEmail: "jim.phillips@oberonlogistics.com",
+                  isPrimary: false,
+                  verificationStatus: "accepted",
+                },
+              ],
+            }),
+          });
+        }
+        if (u.includes("/messages/") && !u.includes("/messages/send")) {
+          return /** @type {Response} */ ({
+            ok: true,
+            json: async () => ({
+              id: "inbound-9",
+              threadId: "thr-logistics",
+              payload: {
+                headers: [
+                  { name: "Delivered-To", value: "jim.phillips@oberonlogistics.com" },
+                  { name: "To", value: "Jim <jim.phillips@oberonlogistics.com>" },
+                  { name: "From", value: "Carrier <dispatch@carrier.com>" },
+                  { name: "Subject", value: "Load 1042" },
+                  { name: "Message-ID", value: "<abc@carrier.com>" },
+                  { name: "References", value: "<root@carrier.com>" },
+                ],
+              },
+            }),
+          });
+        }
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => ({
+            id: "reply-runner",
+            threadId: "thr-logistics",
+            raw: "must-not-return",
+          }),
+        });
+      },
+    });
+
+    const result = await runTool("reply_as", {
+      messageId: "inbound-9",
+      body: "Confirmed.",
+      attachments: [
+        { filename: "rate-con.pdf", contentBase64: pdf.toString("base64") },
+      ],
+    });
+    assert.deepEqual(result, { id: "reply-runner", threadId: "thr-logistics" });
+    const send = calls.find((c) => c.url.includes("/messages/send"));
+    const inspected = inspectSendCall(send);
+    assert.equal(inspected.body.threadId, "thr-logistics");
+    assert.match(inspected.mime, /^From: jim\.phillips@oberonlogistics\.com\r$/m);
+    assert.match(inspected.mime, /Content-Disposition: attachment; filename="rate-con\.pdf"/);
+    assert.doesNotMatch(JSON.stringify(result), /must-not-return/);
   });
 });
 
