@@ -2,7 +2,7 @@
   "name": "gmail-sendas",
   "displayName": "Gmail sendAs + attachments",
   "version": "1.2.0",
-  "description": "Thin Gmail MCP for sendAs aliases, in-thread reply_send_as, and inbound/outbound attachments. Complements stock Gmail MCP — do not use this plugin for inbox search, labels, or triage.",
+  "description": "Thin Gmail MCP for sendAs aliases, in-thread thread_send_as, and inbound/outbound attachments. Complements stock Gmail MCP — do not use this plugin for inbox search, labels, or triage.",
   "author": {
     "name": "Oberon"
   },

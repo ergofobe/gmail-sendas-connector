@@ -486,7 +486,7 @@ function mockReplyFetch({
   return { calls, fetchImpl };
 }
 
-describe("reply_send_as From inference + threading", () => {
+describe("thread_send_as From inference + threading", () => {
   it("infers From from Delivered-To when it matches sendAs", () => {
     const headers = collectHeaders([
       { name: "Delivered-To", value: "Jim.Phillips@OberonLogistics.com" },

@@ -2,7 +2,7 @@
   "name": "gmail-sendas",
   "version": "1.2.0",
   "private": true,
-  "description": "Cursor plugin: Gmail sendAs, in-thread reply_send_as, and inbound/outbound attachments (complements stock Gmail MCP)",
+  "description": "Cursor plugin: Gmail sendAs, in-thread thread_send_as, and inbound/outbound attachments (complements stock Gmail MCP)",
   "type": "module",
   "engines": {
     "node": ">=18"
