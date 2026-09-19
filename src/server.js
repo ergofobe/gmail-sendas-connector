@@ -48,7 +48,7 @@ export const TOOL_DEFS = [
   {
     name: "list_send_as",
     description:
-      "List Gmail sendAs aliases (GET users.me.settings.sendAs). Use this plugin only for sendAs + in-thread reply_as + attachment bytes. Use stock Gmail MCP for inbox search, labels, and triage.",
+      "List Gmail sendAs aliases (GET users.me.settings.sendAs). Use this plugin only for sendAs + in-thread reply_send_as + attachment bytes. Use stock Gmail MCP for inbox search, labels, and triage.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -58,7 +58,7 @@ export const TOOL_DEFS = [
   {
     name: "send_as",
     description:
-      "Send a new message From a Workspace sendAs alias via users.messages.send (RFC2822 MIME raw, base64url). Required: from (alias email), to, subject, and body text and/or html. Optional: cc, bcc, attachments (local path preferred; contentBase64 fallback). First-class attach types: PDF, JPG/JPEG, PNG. Combined message must be under ~25MB. Returns message id (and threadId) only — never tokens or file bytes. For in-thread replies that must From the landed alias, use reply_as instead of stock Gmail reply.",
+      "Send a new message From a Workspace sendAs alias via users.messages.send (RFC2822 MIME raw, base64url). Required: from (alias email), to, subject, and body text and/or html. Optional: cc, bcc, attachments (local path preferred; contentBase64 fallback). First-class attach types: PDF, JPG/JPEG, PNG. Combined message must be under ~25MB. Returns message id (and threadId) only — never tokens or file bytes. For in-thread replies that must From the landed alias, use reply_send_as instead of stock Gmail reply.",
     inputSchema: {
       type: "object",
       properties: {
@@ -84,7 +84,7 @@ export const TOOL_DEFS = [
     },
   },
   {
-    name: "reply_as",
+    name: "reply_send_as",
     description:
       "Reply in an existing Gmail thread From the address the mail landed on (or an explicit sendAs alias). Required: messageId (inbound Gmail message to reply to) and body and/or html. Optional: threadId (defaults to the parent message threadId), from, to, cc, bcc, replyAll, attachments (same shape as send_as). From resolution: explicit from if provided (must be a sendAs alias); else first of Delivered-To, X-Original-To, To that matches a sendAs alias (case-insensitive). Sends via users.messages.send with threadId plus In-Reply-To/References. Returns { id, threadId } only. Use instead of stock Gmail reply when the inbound landed on an alias (e.g. logistics) rather than the primary mailbox.",
     inputSchema: {
@@ -185,7 +185,7 @@ export function createToolRunner({
           bcc: /** @type {string|undefined} */ (args.bcc),
           attachments: args.attachments,
         });
-      case "reply_as":
+      case "reply_send_as":
         return gmail.replyAs({
           messageId: /** @type {string} */ (args.messageId),
           threadId: /** @type {string|undefined} */ (args.threadId),

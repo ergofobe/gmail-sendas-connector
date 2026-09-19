@@ -18,14 +18,14 @@ describe("MCP surface", () => {
     });
     const listed = await handle({ jsonrpc: "2.0", id: 1, method: "tools/list" });
     const names = listed.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["get_attachment", "list_send_as", "reply_as", "send_as"]);
+    assert.deepEqual(names, ["get_attachment", "list_send_as", "reply_send_as", "send_as"]);
     assert.equal(TOOL_DEFS.length, 4);
     const sendAs = listed.result.tools.find((t) => t.name === "send_as");
     assert.ok(sendAs.inputSchema.properties.attachments);
     assert.ok(sendAs.inputSchema.properties.attachments.items.properties.path);
     assert.ok(sendAs.inputSchema.properties.attachments.items.properties.contentBase64);
     assert.deepEqual(sendAs.inputSchema.required, ["from", "to", "subject"]);
-    const replyAs = listed.result.tools.find((t) => t.name === "reply_as");
+    const replyAs = listed.result.tools.find((t) => t.name === "reply_send_as");
     assert.deepEqual(replyAs.inputSchema.required, ["messageId"]);
     assert.ok(replyAs.inputSchema.properties.from);
     assert.ok(replyAs.inputSchema.properties.replyAll);
@@ -162,7 +162,7 @@ describe("createToolRunner send_as wiring", () => {
   });
 });
 
-describe("createToolRunner reply_as wiring", () => {
+describe("createToolRunner reply_send_as wiring", () => {
   it("forwards messageId + attachments and returns id + threadId only", async () => {
     const pdf = Buffer.from("%PDF-1.4 runner-reply", "utf8");
     /** @type {{ url: string, init: RequestInit }[]} */
@@ -226,7 +226,7 @@ describe("createToolRunner reply_as wiring", () => {
       },
     });
 
-    const result = await runTool("reply_as", {
+    const result = await runTool("reply_send_as", {
       messageId: "inbound-9",
       body: "Confirmed.",
       attachments: [

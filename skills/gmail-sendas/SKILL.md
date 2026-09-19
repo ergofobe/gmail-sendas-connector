@@ -2,9 +2,9 @@
 name: gmail-sendas
 description: >
   Send Gmail from a specific Workspace sendAs alias (including outbound file
-  attachments), reply in-thread From the landed alias (reply_as), list sendAs
+  attachments), reply in-thread From the landed alias (reply_send_as), list sendAs
   aliases, or download inbound attachment bytes. Use this plugin only for
-  sendAs + reply_as + attachments. Use stock Gmail MCP for inbox search,
+  sendAs + reply_send_as + attachments. Use stock Gmail MCP for inbox search,
   labels, and triage (including stock reply when From the primary mailbox is
   fine).
 ---
@@ -16,7 +16,7 @@ description: >
 Use **this plugin** when the task is one of:
 
 - Sending a **new** message that **must leave From a specific Workspace alias** (`send_as`)
-- **In-thread reply** that must From the address the mail landed on, or another sendAs (`reply_as`) — stock Gmail `reply` threads correctly but always sends From the primary mailbox
+- **In-thread reply** that must From the address the mail landed on, or another sendAs (`reply_send_as`) — stock Gmail `reply` threads correctly but always sends From the primary mailbox
 - **Attach-on-send**: the caller already has a local PDF/JPG/PNG (or other file) and must email it From that alias — do **not** fall back to the Gmail compose UI
 - Listing the mailbox's sendAs aliases (`list_send_as`)
 - Downloading **inbound attachment bytes** (PDFs, rate cons, BOLs) that the stock Gmail connector cannot fetch
@@ -36,17 +36,17 @@ Do **not** treat this plugin as a full Gmail replacement.
 | --- | --- |
 | `list_send_as` | Confirm which aliases exist and which is default/verified |
 | `send_as` | **New** message with `from` set to the alias email; optional `cc` / `bcc`; `body` and/or `html`; optional `attachments` |
-| `reply_as` | **In-thread reply** From the landed alias (or explicit `from`). Required: `messageId` + `body` and/or `html`. Optional: `threadId`, `from`, `to` / `cc` / `bcc`, `replyAll`, `attachments` |
+| `reply_send_as` | **In-thread reply** From the landed alias (or explicit `from`). Required: `messageId` + `body` and/or `html`. Optional: `threadId`, `from`, `to` / `cc` / `bcc`, `replyAll`, `attachments` |
 | `get_attachment` | Decode **inbound** attachment bytes; write to `path` when the user needs a file on disk |
 
-`send_as` and `reply_as` return `{ id, threadId }` only. Never ask them to print tokens, raw MIME, or file contents.
+`send_as` and `reply_send_as` return `{ id, threadId }` only. Never ask them to print tokens, raw MIME, or file contents.
 
-## `reply_as` vs `send_as` vs stock Gmail `reply`
+## `reply_send_as` vs `send_as` vs stock Gmail `reply`
 
 | Need | Tool |
 | --- | --- |
 | New outbound that must From an alias | `send_as` |
-| Reply that must From the landed alias (e.g. logistics inbound) | `reply_as` |
+| Reply that must From the landed alias (e.g. logistics inbound) | `reply_send_as` |
 | Reply when From the primary mailbox is OK | stock Gmail `reply` |
 
 `messageId` is required (the inbound Gmail message to reply to). `threadId` is optional and is taken from that message when omitted.
@@ -119,9 +119,9 @@ Rules:
 
 - First-class types: **PDF, JPG/JPEG, PNG**. Other types are OK if `mimeType` is provided.
 - Combined message size (headers + body + encoded attachments) must stay under Gmail's **~25MB** limit. If the tool rejects oversize, shrink or drop files — do not retry a live send.
-- `get_attachment` is inbound only. Outbound files go on `send_as` or `reply_as`, not through compose UI.
+- `get_attachment` is inbound only. Outbound files go on `send_as` or `reply_send_as`, not through compose UI.
 
-After this plugin is updated, **restart or reinstall the MCP server** (Grok Bot stdio installs included). `tools/list` is served from process memory; a running stdio server will not show `reply_as` or `attachments` until restart.
+After this plugin is updated, **restart or reinstall the MCP server** (Grok Bot stdio installs included). `tools/list` is served from process memory; a running stdio server will not show `reply_send_as` or `attachments` until restart.
 
 ## From-routing policy (examples)
 
@@ -137,7 +137,7 @@ If the user names a brand ("send as logistics") and `list_send_as` has a matchin
 
 1. If From-routing is required and the alias is unknown: `list_send_as`.
 2. **New message:** `send_as` (`from` = alias email, never the stock Gmail "send" tool). Add `attachments: [{ path }]` when a local file should go out with the message.
-3. **In-thread reply that must From the landed alias:** `reply_as` with the inbound `messageId` (omit `from` to infer Delivered-To / X-Original-To / To). Do **not** use stock Gmail `reply` for alias-landed mail — it always sends From the primary mailbox.
+3. **In-thread reply that must From the landed alias:** `reply_send_as` with the inbound `messageId` (omit `from` to infer Delivered-To / X-Original-To / To). Do **not** use stock Gmail `reply` for alias-landed mail — it always sends From the primary mailbox.
 4. For an inbound file: get `messageId` + `attachmentId` from stock Gmail, then `get_attachment` (set `filename` + `path` when writing a PDF to disk).
 
 ## Auth
