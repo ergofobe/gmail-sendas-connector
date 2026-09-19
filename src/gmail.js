@@ -260,7 +260,7 @@ export function collectLandedAddresses(headers) {
 }
 
 /**
- * Resolve the From alias for reply_as.
+ * Resolve the From alias for reply_send_as.
  * 1. Explicit `from` must be a sendAs alias.
  * 2. Else first landed header (Delivered-To, X-Original-To, To) that matches sendAs.
  * 3. Else fail — caller must pass explicit from.
