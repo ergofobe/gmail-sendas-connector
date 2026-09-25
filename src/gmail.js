@@ -56,6 +56,23 @@
  * @property {string} [body]
  * @property {string} [html]
  * @property {SendAttachmentInput[]|SendAttachmentInput|ResolvedAttachment[]} [attachments]
+ *
+ * @typedef {object} DraftAsArgs
+ * @property {string} from sendAs alias email (must be on the mailbox sendAs list and verified)
+ * @property {string} to
+ * @property {string} subject
+ * @property {string} [body] plain-text body
+ * @property {string} [html] HTML body (used with or instead of body)
+ * @property {string} [cc]
+ * @property {string} [bcc]
+ * @property {string} [threadId] optional Gmail thread id (draft stays in-thread)
+ * @property {string} [inReplyTo] RFC Message-ID of the parent (reply threading)
+ * @property {string} [references] RFC References chain (reply threading)
+ * @property {SendAttachmentInput[]|SendAttachmentInput|ResolvedAttachment[]} [attachments]
+ *
+ * @typedef {object} DraftResult
+ * @property {string} id Gmail draft id
+ * @property {string} [threadId]
  */
 
 import { randomBytes } from "node:crypto";
@@ -78,6 +95,8 @@ const PRIMARY_MIME_BY_EXT = {
 
 const SEND_ENDPOINT = `${GMAIL_API}/users/me/messages/send`;
 const SEND_AS_ENDPOINT = `${GMAIL_API}/users/me/settings/sendAs`;
+const DRAFTS_CREATE_ENDPOINT = `${GMAIL_API}/users/me/drafts`;
+const DRAFTS_SEND_ENDPOINT = `${GMAIL_API}/users/me/drafts/send`;
 
 /** Parent headers fetched for From inference + RFC2822 reply threading. */
 export const REPLY_METADATA_HEADERS = [
@@ -153,6 +172,24 @@ export function parseSendResult(payload) {
 }
 
 /**
+ * @param {unknown} payload
+ * @returns {DraftResult}
+ */
+export function parseDraftResult(payload) {
+  if (!payload || typeof payload.id !== "string" || payload.id.length === 0) {
+    throw new Error("Gmail drafts.create did not return a draft id");
+  }
+  /** @type {DraftResult} */
+  const result = { id: payload.id };
+  const message =
+    payload.message && typeof payload.message === "object" ? payload.message : {};
+  if (typeof message.threadId === "string" && message.threadId.length > 0) {
+    result.threadId = message.threadId;
+  }
+  return result;
+}
+
+/**
  * @param {unknown} value
  * @returns {string[]}
  */
@@ -186,6 +223,64 @@ export function matchSendAs(emailOrHeader, aliases) {
   if (!needle) return null;
   const list = Array.isArray(aliases) ? aliases : [];
   return list.find((row) => row && normalizeEmail(row.sendAsEmail) === needle) || null;
+}
+
+/**
+ * Gmail sendAs is usable when verificationStatus is accepted, or the row is primary
+ * (primary addresses are always accepted).
+ * @param {SendAs|null|undefined} row
+ * @returns {boolean}
+ */
+export function isVerifiedSendAs(row) {
+  if (!row || typeof row !== "object") return false;
+  if (row.isPrimary === true) return true;
+  return String(row.verificationStatus || "").trim().toLowerCase() === "accepted";
+}
+
+/**
+ * Validate `from` against GET users.me.settings.sendAs (same source as list_send_as).
+ * Rejects unknown and unverified aliases.
+ * @param {unknown} from
+ * @param {SendAs[]} aliases
+ * @returns {string} canonical sendAsEmail
+ */
+export function requireVerifiedSendAs(from, aliases) {
+  const wanted = String(from || "").trim();
+  if (!wanted) {
+    throw new Error("from is required (sendAs alias email)");
+  }
+  const list = Array.isArray(aliases) ? aliases : [];
+  const match = matchSendAs(wanted, list);
+  if (!match) {
+    throw new Error(
+      `from (${wanted}) is not an allowed sendAs alias on this mailbox. Call list_send_as and pass a verified from.`
+    );
+  }
+  if (!isVerifiedSendAs(match)) {
+    const status = String(match.verificationStatus || "").trim() || "(empty)";
+    throw new Error(
+      `from (${match.sendAsEmail}) is not a verified sendAs alias (verificationStatus=${status}). Use a verified alias from list_send_as.`
+    );
+  }
+  return match.sendAsEmail;
+}
+
+/**
+ * Normalize In-Reply-To / References the same way thread_send_as does.
+ * @param {unknown} [inReplyTo]
+ * @param {unknown} [references]
+ * @returns {{ inReplyTo: string, references: string }}
+ */
+export function draftThreadingFromArgs(inReplyTo, references) {
+  const inReplyToRaw = inReplyTo != null ? String(inReplyTo).trim() : "";
+  const referencesRaw = references != null ? String(references).trim() : "";
+  if (!inReplyToRaw && !referencesRaw) {
+    return { inReplyTo: "", references: "" };
+  }
+  return buildThreadingHeaders({
+    "message-id": inReplyToRaw ? [inReplyToRaw] : [],
+    references: referencesRaw ? [referencesRaw] : [],
+  });
 }
 
 /**
@@ -946,6 +1041,51 @@ export function createGmailClient({
     },
 
     /**
+     * POST users.drafts.create with RFC2822 raw (base64url). Never sends.
+     * `from` must be a verified sendAs alias (same list as list_send_as).
+     * @param {DraftAsArgs} args
+     * @param {{ boundary?: string, mixedBoundary?: string, altBoundary?: string }} [mimeOpts]
+     * @returns {Promise<DraftResult>}
+     */
+    async draftAs(args, mimeOpts) {
+      const text = args.body == null ? "" : String(args.body);
+      const html = args.html == null ? "" : String(args.html);
+      if (!text && !html) throw new Error("body and/or html is required");
+
+      const aliases = await this.listSendAs();
+      const from = requireVerifiedSendAs(args.from, aliases);
+      const threading = draftThreadingFromArgs(args.inReplyTo, args.references);
+      const attachments = await resolveSendAttachments(args.attachments);
+      const mime = buildRfc2822(
+        {
+          from,
+          to: args.to,
+          subject: args.subject,
+          body: text || undefined,
+          html: html || undefined,
+          cc: args.cc,
+          bcc: args.bcc,
+          attachments,
+          inReplyTo: threading.inReplyTo || undefined,
+          references: threading.references || undefined,
+        },
+        mimeOpts
+      );
+
+      /** @type {{ raw: string, threadId?: string }} */
+      const message = { raw: toBase64Url(mime) };
+      const threadId = args.threadId != null ? String(args.threadId).trim() : "";
+      if (threadId) message.threadId = threadId;
+
+      const payload = await gmailFetch(DRAFTS_CREATE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      return parseDraftResult(payload);
+    },
+
+    /**
      * In-thread reply From a sendAs alias (inferred or explicit).
      * POST users.messages.send with { raw, threadId }.
      * @param {ReplyAsArgs} args
@@ -1070,4 +1210,32 @@ export function inspectSendCall(call) {
   const body = typeof init.body === "string" ? JSON.parse(init.body) : {};
   const mime = Buffer.from(String(body.raw || ""), "base64url").toString("utf8");
   return { url, method: init.method || "GET", body, mime };
+}
+
+/**
+ * Inspect a captured drafts.create fetch for tests.
+ * @param {{ url: string, init: RequestInit }} call
+ */
+export function inspectDraftCall(call) {
+  const url = String(call.url);
+  const init = call.init || {};
+  const body = typeof init.body === "string" ? JSON.parse(init.body) : {};
+  const message = body.message && typeof body.message === "object" ? body.message : {};
+  const mime = Buffer.from(String(message.raw || ""), "base64url").toString("utf8");
+  return { url, method: init.method || "GET", body, mime, message };
+}
+
+/**
+ * True when a Gmail URL is a send endpoint (messages.send or drafts.send).
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isGmailSendEndpoint(url) {
+  const value = String(url);
+  return (
+    value === SEND_ENDPOINT ||
+    value.startsWith(`${SEND_ENDPOINT}?`) ||
+    value === DRAFTS_SEND_ENDPOINT ||
+    value.startsWith(`${DRAFTS_SEND_ENDPOINT}?`)
+  );
 }

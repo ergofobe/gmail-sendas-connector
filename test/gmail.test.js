@@ -11,11 +11,16 @@ import {
   createGmailClient,
   fromBase64Url,
   inferMimeType,
+  inspectDraftCall,
   inspectSendCall,
+  isGmailSendEndpoint,
+  isVerifiedSendAs,
   messageGetUrl,
+  parseDraftResult,
   parseSendAsList,
   parseSendResult,
   replySubject,
+  requireVerifiedSendAs,
   resolveReplyFrom,
   resolveSendAttachments,
   toBase64Url,
@@ -705,6 +710,322 @@ describe("thread_send_as From inference + threading", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("draft_as drafts.create (never sends)", () => {
+  const TRACKING_URL = "https://ptycoin.com/some/path?utm_source=x&utm_medium=y";
+  const DRAFTS_URL = `${GMAIL_API}/users/me/drafts`;
+
+  function mockDraftFetch({
+    sendAs = DEFAULT_SEND_AS,
+    draftResult = {
+      id: "draft-1",
+      message: { id: "msg-draft-1", threadId: "thr-draft", labelIds: ["DRAFT"] },
+    },
+  } = {}) {
+    /** @type {{ url: string, init: RequestInit }[]} */
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      const u = String(url);
+      calls.push({ url: u, init: init || {} });
+      if (isGmailSendEndpoint(u)) {
+        throw new Error(`send endpoint must not be called: ${u}`);
+      }
+      if (u.includes("/settings/sendAs")) {
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => ({ sendAs }),
+        });
+      }
+      if (u === DRAFTS_URL) {
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => draftResult,
+        });
+      }
+      throw new Error(`unexpected url ${u}`);
+    };
+    return { calls, fetchImpl };
+  }
+
+  function assertNoSend(calls) {
+    assert.equal(calls.filter((c) => isGmailSendEndpoint(c.url)).length, 0);
+    for (const call of calls) {
+      assert.equal(isGmailSendEndpoint(call.url), false);
+    }
+  }
+
+  it("rejects unknown and unverified aliases before drafts.create", async () => {
+    const sendAs = [
+      ...DEFAULT_SEND_AS,
+      {
+        sendAsEmail: "pending@oberonlogistics.com",
+        displayName: "Pending",
+        isPrimary: false,
+        isDefault: false,
+        verificationStatus: "pending",
+      },
+    ];
+    const { calls, fetchImpl } = mockDraftFetch({ sendAs });
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+
+    await assert.rejects(
+      () =>
+        client.draftAs({
+          from: "not-an-alias@oberon.group",
+          to: "a@b.com",
+          subject: "Nope",
+          body: "x",
+        }),
+      /not an allowed sendAs alias/
+    );
+    await assert.rejects(
+      () =>
+        client.draftAs({
+          from: "pending@oberonlogistics.com",
+          to: "a@b.com",
+          subject: "Nope",
+          body: "x",
+        }),
+      /not a verified sendAs alias.*pending/
+    );
+    assert.equal(calls.filter((c) => c.url === DRAFTS_URL).length, 0);
+    assertNoSend(calls);
+
+    assert.equal(isVerifiedSendAs(sendAs[2]), false);
+    assert.throws(
+      () => requireVerifiedSendAs("pending@oberonlogistics.com", sendAs),
+      /not a verified sendAs alias/
+    );
+    assert.throws(
+      () => requireVerifiedSendAs("unknown@elsewhere.com", sendAs),
+      /not an allowed sendAs alias/
+    );
+  });
+
+  it("text-only draft posts raw MIME to drafts.create with alias From", async () => {
+    const { calls, fetchImpl } = mockDraftFetch();
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+    const result = await client.draftAs({
+      from: LOGISTICS,
+      to: "counterparty@example.com",
+      subject: "Draft text",
+      body: "Plain draft body",
+    });
+
+    assert.deepEqual(result, { id: "draft-1", threadId: "thr-draft" });
+    const create = calls.find((c) => c.url === DRAFTS_URL);
+    const inspected = inspectDraftCall(create);
+    assert.equal(inspected.method, "POST");
+    assert.equal(Object.keys(inspected.body).join(","), "message");
+    assert.equal(Object.keys(inspected.message).join(","), "raw");
+    assert.match(inspected.mime, /^From: jim\.phillips@oberonlogistics\.com\r$/m);
+    assert.match(inspected.mime, /^Content-Type: text\/plain; charset="UTF-8"\r$/m);
+    assert.match(inspected.mime, /^Content-Transfer-Encoding: 8bit\r$/m);
+    assert.match(inspected.mime, /Plain draft body/);
+    assert.doesNotMatch(inspected.mime, /multipart\//);
+    assertNoSend(calls);
+  });
+
+  it("html-only draft uses text/html 8bit (no quoted-printable)", async () => {
+    const { calls, fetchImpl } = mockDraftFetch();
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+    await client.draftAs({
+      from: LOGISTICS,
+      to: "a@b.com",
+      subject: "Draft html",
+      html: "<p>HTML only</p>",
+    });
+    const inspected = inspectDraftCall(calls.find((c) => c.url === DRAFTS_URL));
+    assert.match(inspected.mime, /^Content-Type: text\/html; charset="UTF-8"\r$/m);
+    assert.match(inspected.mime, /^Content-Transfer-Encoding: 8bit\r$/m);
+    assert.match(inspected.mime, /<p>HTML only<\/p>/);
+    assert.doesNotMatch(inspected.mime, /quoted-printable/i);
+    assertNoSend(calls);
+  });
+
+  it("text+html draft is multipart/alternative via the shared MIME builder", async () => {
+    const { calls, fetchImpl } = mockDraftFetch();
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+    await client.draftAs(
+      {
+        from: "Logistics <" + LOGISTICS + ">",
+        to: "a@b.com",
+        subject: "Both",
+        body: "Plain part",
+        html: "<p>HTML part</p>",
+      },
+      { boundary: "alt_draft" }
+    );
+    const inspected = inspectDraftCall(calls.find((c) => c.url === DRAFTS_URL));
+    assert.match(inspected.mime, /^From: jim\.phillips@oberonlogistics\.com\r$/m);
+    assert.match(
+      inspected.mime,
+      /Content-Type: multipart\/alternative; boundary="alt_draft"/
+    );
+    assert.match(inspected.mime, /Plain part/);
+    assert.match(inspected.mime, /<p>HTML part<\/p>/);
+    const expected = buildRfc2822(
+      {
+        from: LOGISTICS,
+        to: "a@b.com",
+        subject: "Both",
+        body: "Plain part",
+        html: "<p>HTML part</p>",
+      },
+      { boundary: "alt_draft" }
+    );
+    assert.equal(inspected.message.raw, toBase64Url(expected));
+    assertNoSend(calls);
+  });
+
+  it("attachments use multipart/mixed with the same path/base64 shape as send_as", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "gmail-draft-as-"));
+    const dest = path.join(dir, "invoice.PDF");
+    const pdf = Buffer.from("%PDF-1.4 draft-attach-bytes", "utf8");
+    await writeFile(dest, pdf);
+    const png = Buffer.from("\x89PNG draft-png", "binary");
+
+    try {
+      const { calls, fetchImpl } = mockDraftFetch({
+        draftResult: {
+          id: "draft-att",
+          message: { id: "msg-att", threadId: "thr-att", labelIds: ["DRAFT"] },
+        },
+      });
+      const client = createGmailClient({
+        getAccessToken: async () => "test-access-token",
+        fetchImpl,
+      });
+      const result = await client.draftAs(
+        {
+          from: LOGISTICS,
+          to: "ap@counterparty.com",
+          subject: "Invoice draft",
+          body: "Please find the invoice attached.",
+          attachments: [
+            { path: dest },
+            {
+              filename: "stamp.png",
+              contentBase64: png.toString("base64"),
+            },
+          ],
+        },
+        { mixedBoundary: "mix_draft" }
+      );
+      assert.deepEqual(result, { id: "draft-att", threadId: "thr-att" });
+      const inspected = inspectDraftCall(calls.find((c) => c.url === DRAFTS_URL));
+      assert.match(inspected.mime, /Content-Type: multipart\/mixed; boundary="mix_draft"/);
+      assert.match(inspected.mime, /Content-Type: application\/pdf; name="invoice\.PDF"/);
+      assert.match(
+        inspected.mime,
+        /Content-Disposition: attachment; filename="invoice\.PDF"/
+      );
+      assert.match(inspected.mime, /Content-Disposition: attachment; filename="stamp\.png"/);
+      assert.match(
+        inspected.mime,
+        new RegExp(pdf.toString("base64").replace(/[+]/g, "\\+"))
+      );
+      assertNoSend(calls);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("threaded variant sets In-Reply-To / References and threadId on the draft", async () => {
+    const threading = buildThreadingHeaders(
+      collectHeaders([
+        { name: "Message-ID", value: "<abc@carrier.com>" },
+        { name: "References", value: "<root@carrier.com>" },
+      ])
+    );
+    const { calls, fetchImpl } = mockDraftFetch({
+      draftResult: {
+        id: "draft-thr",
+        message: { id: "msg-thr", threadId: "thr-logistics", labelIds: ["DRAFT"] },
+      },
+    });
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+    await client.draftAs({
+      from: LOGISTICS,
+      to: "Carrier Ops <dispatch@carrier.com>",
+      subject: "Re: Load 1042",
+      body: "Draft reply in thread.",
+      threadId: "thr-logistics",
+      inReplyTo: threading.inReplyTo,
+      references: threading.references,
+    });
+
+    const inspected = inspectDraftCall(calls.find((c) => c.url === DRAFTS_URL));
+    assert.equal(inspected.message.threadId, "thr-logistics");
+    assert.equal(Object.keys(inspected.message).sort().join(","), "raw,threadId");
+    assert.match(inspected.mime, /^In-Reply-To: <abc@carrier\.com>\r$/m);
+    assert.match(
+      inspected.mime,
+      /^References: <root@carrier\.com> <abc@carrier\.com>\r$/m
+    );
+    assert.match(inspected.mime, /^From: jim\.phillips@oberonlogistics\.com\r$/m);
+    assertNoSend(calls);
+  });
+
+  it("keeps https://ptycoin.com tracking URL byte-exact in decoded MIME", async () => {
+    const { calls, fetchImpl } = mockDraftFetch();
+    const client = createGmailClient({
+      getAccessToken: async () => "test-access-token",
+      fetchImpl,
+    });
+    const html = `<p>See <a href="${TRACKING_URL}">link</a></p>`;
+    await client.draftAs({
+      from: LOGISTICS,
+      to: "a@b.com",
+      subject: "URL intact",
+      body: `Visit ${TRACKING_URL}`,
+      html,
+    });
+    const inspected = inspectDraftCall(calls.find((c) => c.url === DRAFTS_URL));
+    const idxText = inspected.mime.indexOf(TRACKING_URL);
+    const idxHtml = inspected.mime.indexOf(TRACKING_URL, idxText + 1);
+    assert.notEqual(idxText, -1);
+    assert.notEqual(idxHtml, -1);
+    assert.equal(
+      inspected.mime.slice(idxText, idxText + TRACKING_URL.length),
+      TRACKING_URL
+    );
+    assert.equal(
+      inspected.mime.slice(idxHtml, idxHtml + TRACKING_URL.length),
+      TRACKING_URL
+    );
+    assert.doesNotMatch(inspected.mime, /google\.com\/url/);
+    assert.doesNotMatch(inspected.mime, /quoted-printable/i);
+    assert.doesNotMatch(inspected.mime, /utm_source=3D/);
+    assertNoSend(calls);
+  });
+
+  it("parseDraftResult requires a draft id", () => {
+    assert.deepEqual(
+      parseDraftResult({
+        id: "d1",
+        message: { id: "m1", threadId: "t1" },
+      }),
+      { id: "d1", threadId: "t1" }
+    );
+    assert.throws(() => parseDraftResult({ message: { id: "m1" } }), /draft id/);
   });
 });
 

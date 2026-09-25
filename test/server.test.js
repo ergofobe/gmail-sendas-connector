@@ -6,11 +6,11 @@ import {
   createToolRunner,
   TOOL_DEFS,
 } from "../src/server.js";
-import { inspectSendCall } from "../src/gmail.js";
+import { inspectDraftCall, inspectSendCall } from "../src/gmail.js";
 import { buildAuthUrl, exchangeCode, OAUTH_SCOPES } from "../scripts/oauth-setup.js";
 
 describe("MCP surface", () => {
-  it("lists exactly the four gap tools", async () => {
+  it("lists exactly the five gap tools", async () => {
     const handle = createMessageHandler({
       runTool: async () => {
         throw new Error("should not run");
@@ -18,13 +18,29 @@ describe("MCP surface", () => {
     });
     const listed = await handle({ jsonrpc: "2.0", id: 1, method: "tools/list" });
     const names = listed.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["get_attachment", "list_send_as", "send_as", "thread_send_as"]);
-    assert.equal(TOOL_DEFS.length, 4);
+    assert.deepEqual(names, [
+      "draft_as",
+      "get_attachment",
+      "list_send_as",
+      "send_as",
+      "thread_send_as",
+    ]);
+    assert.equal(TOOL_DEFS.length, 5);
     const sendAs = listed.result.tools.find((t) => t.name === "send_as");
     assert.ok(sendAs.inputSchema.properties.attachments);
     assert.ok(sendAs.inputSchema.properties.attachments.items.properties.path);
     assert.ok(sendAs.inputSchema.properties.attachments.items.properties.contentBase64);
     assert.deepEqual(sendAs.inputSchema.required, ["from", "to", "subject"]);
+    const draftAs = listed.result.tools.find((t) => t.name === "draft_as");
+    assert.deepEqual(draftAs.inputSchema.required, ["from", "to", "subject"]);
+    assert.ok(draftAs.inputSchema.properties.attachments);
+    assert.ok(draftAs.inputSchema.properties.attachments.items.properties.path);
+    assert.ok(draftAs.inputSchema.properties.attachments.items.properties.contentBase64);
+    assert.ok(draftAs.inputSchema.properties.threadId);
+    assert.ok(draftAs.inputSchema.properties.inReplyTo);
+    assert.ok(draftAs.inputSchema.properties.references);
+    assert.match(draftAs.description, /users\.drafts\.create/);
+    assert.match(draftAs.description, /Never sends/i);
     const threadSendAs = listed.result.tools.find((t) => t.name === "thread_send_as");
     assert.deepEqual(threadSendAs.inputSchema.required, ["messageId"]);
     assert.ok(threadSendAs.inputSchema.properties.from);
@@ -239,6 +255,74 @@ describe("createToolRunner thread_send_as wiring", () => {
     assert.equal(inspected.body.threadId, "thr-logistics");
     assert.match(inspected.mime, /^From: jim\.phillips@oberonlogistics\.com\r$/m);
     assert.match(inspected.mime, /Content-Disposition: attachment; filename="rate-con\.pdf"/);
+    assert.doesNotMatch(JSON.stringify(result), /must-not-return/);
+  });
+});
+
+describe("createToolRunner draft_as wiring", () => {
+  it("creates a draft via drafts.create and never calls send", async () => {
+    const png = Buffer.from("png-draft-runner", "utf8");
+    /** @type {{ url: string, init: RequestInit }[]} */
+    const calls = [];
+    const runTool = createToolRunner({
+      env: {
+        GOOGLE_CLIENT_ID: "client.apps.googleusercontent.com",
+        GOOGLE_CLIENT_SECRET: "not-used-because-token-source-not-hit",
+        GOOGLE_REFRESH_TOKEN: "not-used",
+      },
+      fetchImpl: async (url, init) => {
+        const u = String(url);
+        if (u.includes("oauth2.googleapis.com/token")) {
+          return /** @type {Response} */ ({
+            ok: true,
+            json: async () => ({ access_token: "tok", expires_in: 3600 }),
+          });
+        }
+        calls.push({ url: u, init: init || {} });
+        if (u.includes("/settings/sendAs")) {
+          return /** @type {Response} */ ({
+            ok: true,
+            json: async () => ({
+              sendAs: [
+                {
+                  sendAsEmail: "ops@oberonlogistics.com",
+                  displayName: "Logistics",
+                  isPrimary: false,
+                  verificationStatus: "accepted",
+                },
+              ],
+            }),
+          });
+        }
+        if (u.includes("/messages/send") || u.includes("/drafts/send")) {
+          throw new Error(`send endpoint must not be called: ${u}`);
+        }
+        return /** @type {Response} */ ({
+          ok: true,
+          json: async () => ({
+            id: "draft-runner",
+            message: { id: "msg-runner", threadId: "thr-runner", raw: "must-not-return" },
+          }),
+        });
+      },
+    });
+
+    const result = await runTool("draft_as", {
+      from: "ops@oberonlogistics.com",
+      to: "a@b.com",
+      subject: "Runner draft",
+      body: "See file.",
+      attachments: [
+        { filename: "stamp.png", contentBase64: png.toString("base64") },
+      ],
+    });
+    assert.deepEqual(result, { id: "draft-runner", threadId: "thr-runner" });
+    assert.equal(calls.filter((c) => c.url.includes("/messages/send")).length, 0);
+    assert.equal(calls.filter((c) => c.url.includes("/drafts/send")).length, 0);
+    const create = calls.find((c) => c.url.endsWith("/users/me/drafts"));
+    const inspected = inspectDraftCall(create);
+    assert.match(inspected.mime, /^From: ops@oberonlogistics\.com\r$/m);
+    assert.match(inspected.mime, /Content-Disposition: attachment; filename="stamp\.png"/);
     assert.doesNotMatch(JSON.stringify(result), /must-not-return/);
   });
 });
