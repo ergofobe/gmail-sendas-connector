@@ -3,8 +3,9 @@
 Cursor plugin (**Gmail sendAs + attachments**) that fills gaps in the stock Gmail MCP:
 
 1. **From / sendAs** — send a *new* message as a verified Workspace alias, including **attach-on-send** for outbound PDFs/images (`send_as`)
-2. **In-thread reply From the landed alias** — stock Gmail `reply` threads correctly but always sends From the primary mailbox. Use `thread_send_as` when inbound landed on an alias (`thread_send_as`)
-3. **Attachment bytes** — download inbound file data the stock connector cannot return (`get_attachment`)
+2. **Draft From an alias (never sends)** — create a Gmail draft via `users.drafts.create` with From set to a verified sendAs alias (`draft_as`). Does not call `users.messages.send` or `users.drafts.send`.
+3. **In-thread reply From the landed alias** — stock Gmail `reply` threads correctly but always sends From the primary mailbox. Use `thread_send_as` when inbound landed on an alias (`thread_send_as`)
+4. **Attachment bytes** — download inbound file data the stock connector cannot return (`get_attachment`)
 
 Keep **stock Gmail MCP** for inbox search, labels, and triage (including stock `reply` when From the primary mailbox is fine). This plugin is not a Gmail replacement.
 
@@ -17,7 +18,7 @@ Keep **stock Gmail MCP** for inbox search, labels, and triage (including stock `
 ├── skills/gmail-sendas/SKILL.md
 ├── src/
 │   ├── index.js                 # stdio entry
-│   ├── server.js                # MCP JSON-RPC + four tools
+│   ├── server.js                # MCP JSON-RPC + five tools
 │   ├── gmail.js                 # fetch + MIME + OAuth refresh
 │   └── secrets.js               # creds check + redaction
 ├── scripts/oauth-setup.js       # one-time helper; prints refresh token only
@@ -36,21 +37,25 @@ No rules, hooks, agents, or commands.
 | --- | --- | --- |
 | `list_send_as` | `GET https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs` | `SendAs[]` |
 | `send_as` | `POST .../users/me/messages/send` with RFC2822 MIME `raw` (base64url); optional outbound attachments as multipart/mixed | `SendResult` (`id`, optional `threadId`) only |
+| `draft_as` | `POST .../users/me/drafts` (`users.drafts.create`) with RFC2822 MIME `raw` (base64url) inside `{ message }`; optional `message.threadId`. **Never sends** | `DraftResult` (`id` = draft id, optional `threadId`) only |
 | `thread_send_as` | `GET` parent message + `POST .../users/me/messages/send` with `{ raw, threadId }` (In-Reply-To / References) | `SendResult` (`id`, `threadId`) only |
 | `get_attachment` | `GET .../users/me/messages/{messageId}/attachments/{attachmentId}` | `AttachmentBody`; writes a file when `path` is set |
 
-CallDynamicTool must use namespace `user-gmail-sendas` toolName `thread_send_as`.
+CallDynamicTool must use namespace `user-gmail-sendas` toolName `draft_as` (or `thread_send_as` / `send_as`).
 
-**When to use which send/reply tool**
+**When to use which send/reply/draft tool**
 
 | Need | Tool |
 | --- | --- |
 | New message that must From a Workspace alias | `send_as` (this plugin) |
+| Draft that must From a Workspace alias (leave in Drafts; do not send) | `draft_as` (this plugin) |
 | In-thread reply that must From the address the mail landed on (or another sendAs) | `thread_send_as` (this plugin) |
 | In-thread reply when From the primary mailbox is OK | stock Gmail `reply` |
 | Inbox search, labels, triage | stock Gmail MCP |
 
 `send_as` required arguments: `from` (sendAs alias email), `to`, `subject`, and `body` (plain text) and/or `html`. Optional: `cc`, `bcc`, `attachments`. The From header is set to the alias.
+
+`draft_as` required arguments: `from` (must be a **verified** sendAs alias from the same `list_send_as` list; unknown or unverified aliases are rejected), `to`, `subject`, and `body` and/or `html`. Optional: `cc`, `bcc`, `attachments` (same shape and ~25MB cap as `send_as`), and an in-thread variant: `threadId` plus `inReplyTo` / `references` (RFC In-Reply-To / References, derived with the same helper `thread_send_as` uses). MIME is built by the shared `buildRfc2822` path. Body parts use 8bit (not quoted-printable) so URLs in the body are stored exactly as written — no `google.com/url` wrapping. Returns `{ id, threadId }` where `id` is the **draft** id. This tool never calls `users.messages.send` or `users.drafts.send`.
 
 `thread_send_as` required arguments: `messageId` (inbound Gmail message to reply to) and `body` and/or `html`. Optional: `threadId` (defaults to the parent message's threadId), `from`, `to`, `cc`, `bcc`, `replyAll`, `attachments` (same shape as `send_as`). `messageId` is required; `threadId` is optional.
 
@@ -111,7 +116,36 @@ Example `thread_send_as` (omit `from` so Delivered-To can infer the logistics al
 }
 ```
 
-After merge, **restart / reinstall the MCP server** for Grok Bot stdio installs. Tool schemas are loaded at process start (`tools/list` from `TOOL_DEFS`); an already-running stdio process will not advertise `thread_send_as` or `attachments` until it is restarted.
+Example `draft_as` (creates a Draft; does not send):
+
+```json
+{
+  "from": "ops@oberonlogistics.com",
+  "to": "ap@counterparty.com",
+  "subject": "Invoice 1042",
+  "body": "Please find the invoice attached.",
+  "html": "<p>Please find the invoice attached. <a href=\"https://ptycoin.com/some/path?utm_source=x&utm_medium=y\">View</a></p>",
+  "attachments": [
+    { "path": "/workspace/outbox/invoice.PDF" }
+  ]
+}
+```
+
+In-thread draft (same header derivation as `thread_send_as`):
+
+```json
+{
+  "from": "ops@oberonlogistics.com",
+  "to": "dispatch@carrier.com",
+  "subject": "Re: Load 1042",
+  "body": "Draft reply — not sent.",
+  "threadId": "18f2c0abthread",
+  "inReplyTo": "<abc@carrier.com>",
+  "references": "<root@carrier.com> <abc@carrier.com>"
+}
+```
+
+After merge, **restart / reinstall the MCP server** for stdio installs. Tool schemas are loaded at process start (`tools/list` from `TOOL_DEFS`); an already-running stdio process will not advertise `draft_as`, `thread_send_as`, or `attachments` until it is restarted.
 
 OAuth tokens are never returned or logged.
 
@@ -120,6 +154,7 @@ OAuth tokens are never returned or logged.
 ```js
 /** @typedef {{ sendAsEmail: string, displayName?: string, isPrimary?: boolean, isDefault?: boolean, verificationStatus?: string }} SendAs */
 /** @typedef {{ id: string, threadId?: string }} SendResult */
+/** @typedef {{ id: string, threadId?: string }} DraftResult */
 /** @typedef {{ path?: string, filename?: string, mimeType?: string, contentBase64?: string, content?: string }} SendAttachment */
 /** @typedef {{ size: number, data: string, attachmentId: string, filename?: string, path?: string }} AttachmentBody */
 ```
@@ -140,13 +175,14 @@ Sign in as the Google Workspace user who **owns the sendAs aliases** (the Oberon
 2. Create or select a project.
 3. **APIs & Services → Library** → enable **Gmail API**.
 4. **OAuth consent screen**: User type **Internal** (Workspace). App name can be `gmail-sendas`.
-5. Add scopes (minimum):
+5. Add scopes (minimum for send / list / attachment download):
    - `https://www.googleapis.com/auth/gmail.send`
    - `https://www.googleapis.com/auth/gmail.readonly`
    - `https://www.googleapis.com/auth/gmail.settings.basic`
-6. **Credentials → Create credentials → OAuth client ID** → application type **Desktop app** (or Web).
-7. Add authorized redirect URI: `http://127.0.0.1:53682/oauth2callback`
-8. Copy the **client ID** and **client secret**. Leave them out of the repo.
+6. **`draft_as` extra scope (not covered by the three above):** `users.drafts.create` requires **`https://www.googleapis.com/auth/gmail.compose`** or **`https://www.googleapis.com/auth/gmail.modify`**. `gmail.send` can send mail but cannot create drafts. Existing refresh tokens issued with only the three documented send/readonly/settings.basic scopes will get a Gmail API 403 until the OAuth client adds compose (or modify) and the mailbox user re-consents. `scripts/oauth-setup.js` still requests the original three scopes; add compose (or modify) on the consent screen and re-run setup if this mailbox should use `draft_as`.
+7. **Credentials → Create credentials → OAuth client ID** → application type **Desktop app** (or Web).
+8. Add authorized redirect URI: `http://127.0.0.1:53682/oauth2callback`
+9. Copy the **client ID** and **client secret**. Leave them out of the repo.
 
 ### 2. Print a refresh token (stdout only)
 
@@ -186,6 +222,7 @@ Requires Node 18+. Coverage (all mocked):
 - `list_send_as` response parsing
 - `send_as` builds the From header and `users.messages.send` `{ raw }` body
 - `send_as` attachments: multipart/mixed Content-Type / Content-Disposition, path read, base64 fallback, ~25MB oversize reject; no-attachment MIME unchanged
+- `draft_as` validates `from` against sendAs (rejects unknown/unverified), text-only / html-only / multipart/alternative / multipart/mixed attachments, in-thread `threadId` + In-Reply-To / References, URL bytes kept intact, and never calls `messages.send` or `drafts.send`
 - `thread_send_as` From inference (Delivered-To / To), explicit `from` wins, fail when inferred address is not sendAs, In-Reply-To / References / threadId set, attachments on reply
 - `get_attachment` decodes base64url and writes a file of the expected byte length
 - Missing-credential / refresh errors never echo secrets or file contents

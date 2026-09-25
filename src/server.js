@@ -1,13 +1,13 @@
 /**
  * Minimal stdio MCP (newline-delimited JSON-RPC 2.0).
- * No @modelcontextprotocol/sdk — four tools do not need the extra surface.
+ * No @modelcontextprotocol/sdk — five tools do not need the extra surface.
  */
 
 import { createGmailClient, createTokenSource } from "./gmail.js";
 import { missingOAuthVars, safeErrorMessage } from "./secrets.js";
 
 export const PROTOCOL_VERSION = "2025-03-26";
-export const SERVER_INFO = { name: "gmail-sendas", version: "1.2.0" };
+export const SERVER_INFO = { name: "gmail-sendas", version: "1.3.0" };
 
 const ATTACHMENT_ITEMS_SCHEMA = {
   type: "array",
@@ -48,7 +48,7 @@ export const TOOL_DEFS = [
   {
     name: "list_send_as",
     description:
-      "List Gmail sendAs aliases (GET users.me.settings.sendAs). Use this plugin only for sendAs + in-thread thread_send_as + attachment bytes. Use stock Gmail MCP for inbox search, labels, and triage.",
+      "List Gmail sendAs aliases (GET users.me.settings.sendAs). Use this plugin only for sendAs + in-thread thread_send_as + draft_as (never sends) + attachment bytes. Use stock Gmail MCP for inbox search, labels, and triage.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -79,6 +79,50 @@ export const TOOL_DEFS = [
         cc: { type: "string" },
         bcc: { type: "string" },
         attachments: ATTACHMENT_ITEMS_SCHEMA,
+      },
+      required: ["from", "to", "subject"],
+    },
+  },
+  {
+    name: "draft_as",
+    description:
+      "Create a Gmail DRAFT From a verified Workspace sendAs alias via users.drafts.create (RFC2822 MIME raw, base64url). Never sends — does not call users.messages.send or users.drafts.send. Required: from (must be a verified sendAs alias from list_send_as), to, subject, and body text and/or html. Optional: cc, bcc, attachments (same shape as send_as; local path preferred; contentBase64 fallback; ~25MB cap), threadId plus inReplyTo/references for in-thread drafts (same In-Reply-To / References derivation as thread_send_as). Returns draft id (and threadId) only. Links in the body are stored exactly as written.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from: {
+          type: "string",
+          description:
+            "Verified sendAs alias email; written to the From header. Rejected if unknown or unverified (same list as list_send_as).",
+        },
+        to: {
+          type: "string",
+          description: "Recipient email(s), comma-separated",
+        },
+        subject: { type: "string" },
+        body: { type: "string", description: "Plain-text body" },
+        html: {
+          type: "string",
+          description: "HTML body (with or instead of body)",
+        },
+        cc: { type: "string" },
+        bcc: { type: "string" },
+        attachments: ATTACHMENT_ITEMS_SCHEMA,
+        threadId: {
+          type: "string",
+          description:
+            "Optional Gmail thread id. When set, the draft is attached to that thread (users.drafts.create message.threadId).",
+        },
+        inReplyTo: {
+          type: "string",
+          description:
+            "Optional RFC Message-ID of the parent (In-Reply-To). Used with threadId for in-thread drafts; normalized the same way as thread_send_as.",
+        },
+        references: {
+          type: "string",
+          description:
+            "Optional RFC References chain. Combined with inReplyTo using the same header derivation as thread_send_as.",
+        },
       },
       required: ["from", "to", "subject"],
     },
@@ -184,6 +228,20 @@ export function createToolRunner({
           cc: /** @type {string|undefined} */ (args.cc),
           bcc: /** @type {string|undefined} */ (args.bcc),
           attachments: args.attachments,
+        });
+      case "draft_as":
+        return gmail.draftAs({
+          from: /** @type {string} */ (args.from),
+          to: /** @type {string} */ (args.to),
+          subject: /** @type {string} */ (args.subject),
+          body: /** @type {string|undefined} */ (args.body),
+          html: /** @type {string|undefined} */ (args.html),
+          cc: /** @type {string|undefined} */ (args.cc),
+          bcc: /** @type {string|undefined} */ (args.bcc),
+          attachments: args.attachments,
+          threadId: /** @type {string|undefined} */ (args.threadId),
+          inReplyTo: /** @type {string|undefined} */ (args.inReplyTo),
+          references: /** @type {string|undefined} */ (args.references),
         });
       case "thread_send_as":
         return gmail.replyAs({
